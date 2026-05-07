@@ -8,7 +8,7 @@ This repository contains the core logic and systems for a "Trouble in Terrorist 
 * **Dynamic Role Distribution:** Secure logic to assign secret roles (Traitor, Innocent, Detective) to players at the start of each match.
 * **Server-Side Combat:** Projectile and damage logic handled on the server to ensure game integrity and prevent exploitation.
 * **Modular Weapon Framework:** A system designed for easy integration of unique hero abilities and different weapon types.
-* **AI Integration:** Includes logic for [hier kurz ergänzen, z.B.: "NPC pathfinding and basic decision making"], reflecting my interest in Artificial Intelligence within game environments.
+
 
 ## 📂 Code Highlights
 
