@@ -1,6 +1,6 @@
 # Tactical TTT Framework (Roblox/Luau)
 
-This repository contains the core logic and systems for a "Trouble in Terrorist Town" (TTT) remake developed within Roblox Studio using **Luau**. The project focuses on complex state management, server-side authority, and modular gameplay systems.
+This repository contains the core logic and systems for a "Trouble in Terrorist Town" (TTT) remake developed within Roblox Studio using **Luau**. The project focuses on complex state management, server-side authority, and modular gameplay systems. Note: As this is a personal learning project, some comments and variables are still in German. I am currently transitioning my workflow to full English documentation.
 
 ## 🚀 Key Features
 
