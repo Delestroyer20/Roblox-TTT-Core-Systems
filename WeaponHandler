@@ -1,0 +1,790 @@
+--[[
+	WeaponHandler (Script - ServerScriptService)
+
+	Server-side weapon logic for the new tool-based weapon system.
+	Only tools listed in WEAPON_DEFINITIONS are handled here.
+	The raycast logic intentionally mirrors the HitboxTester behavior
+	so shots are not blocked by Brainrot visuals or transparent parts.
+--]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris = game:GetService("Debris")
+local StarterPack = game:GetService("StarterPack")
+local Workspace = game:GetService("Workspace")
+
+local WEAPON_DEFINITIONS = {
+	Shotgun = {
+		toolName = "Shotgun",
+		displayName = "Shotgun",
+		damage = 16,
+		clipSize = 5,
+		fireCooldown = 1.0,
+		reloadTime = 2.6,
+		range = 55,
+		autoFire = false,
+		pellets = 10,
+		spreadAngle = 8,
+		fullDamageRange = 18,
+		damageFalloffEndRange = 55,
+		minDamageMultiplier = 0.22,
+		gripRotationDegrees = Vector3.new(0, 180, 0),
+		tracerForwardOffset = 1.1,
+	},
+	SniperRifle = {
+		toolName = "SniperRifle",
+		displayName = "Sniper Rifle",
+		damage = 99,
+		clipSize = 5,
+		fireCooldown = 1.5,
+		reloadTime = 3,
+		range = 2000,
+		autoFire = false,
+		pellets = 1,
+		spreadAngle = 0,
+	},
+	SMG = {
+		toolName = "SMG",
+		displayName = "SMG",
+		damage = 9,
+		clipSize = 30,
+		fireCooldown = 1 / 12,
+		reloadTime = 1.8,
+		range = 400,
+		autoFire = true,
+		pellets = 1,
+		spreadAngle = 2,
+	},
+}
+
+local MAX_ORIGIN_DISTANCE = 80
+
+local weaponStates = {}
+local WeaponRemote = ReplicatedStorage:WaitForChild("WeaponRemote")
+local normalizingInstances = setmetatable({}, { __mode = "k" })
+local watchedTools = setmetatable({}, { __mode = "k" })
+
+local function getDefinitionByName(name)
+	if typeof(name) ~= "string" or name == "" then
+		return nil
+	end
+
+	for _, definition in pairs(WEAPON_DEFINITIONS) do
+		if definition.toolName == name then
+			return definition
+		end
+	end
+
+	return nil
+end
+
+local function getBulletsFolder(createIfMissing)
+	local bulletsFolder = Workspace:FindFirstChild("BulletsFolder")
+	if not bulletsFolder and createIfMissing then
+		bulletsFolder = Instance.new("Folder")
+		bulletsFolder.Name = "BulletsFolder"
+		bulletsFolder.Parent = Workspace
+	end
+
+	return bulletsFolder
+end
+
+local function prepareVisualPart(part)
+	if not part or not part:IsA("BasePart") then
+		return
+	end
+
+	part.Anchored = false
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.Massless = true
+end
+
+local function applyWeaponGrip(tool, definition)
+	if not tool or not tool:IsA("Tool") or not definition then
+		return
+	end
+
+	if tool:GetAttribute("TTTGripConfigured") then
+		return
+	end
+
+	local gripRotationDegrees = definition.gripRotationDegrees
+	if gripRotationDegrees then
+		tool.Grip = tool.Grip
+			* CFrame.Angles(
+				math.rad(gripRotationDegrees.X),
+				math.rad(gripRotationDegrees.Y),
+				math.rad(gripRotationDegrees.Z)
+			)
+	end
+
+	tool:SetAttribute("TTTGripConfigured", true)
+end
+
+local function getShotVisualOrigin(tool, fallbackOrigin)
+	local handle = tool and tool:FindFirstChild("Handle")
+	if handle and handle:IsA("BasePart") then
+		local tipAttachment = handle:FindFirstChild("TipAttachment")
+		if tipAttachment and tipAttachment:IsA("Attachment") then
+			return tipAttachment.WorldPosition
+		end
+
+		return handle.Position
+	end
+
+	return fallbackOrigin
+end
+
+local function createTracer(startPosition, endPosition, definition)
+	if typeof(startPosition) ~= "Vector3" or typeof(endPosition) ~= "Vector3" then
+		return
+	end
+
+	local offset = endPosition - startPosition
+	local distance = offset.Magnitude
+	if distance <= 0.05 then
+		return
+	end
+
+	local bulletsFolder = getBulletsFolder(true)
+	if not bulletsFolder then
+		return
+	end
+
+	local tracer = Instance.new("Part")
+	tracer.Name = "Bullet"
+	tracer.Anchored = true
+	tracer.CanCollide = false
+	tracer.CanTouch = false
+	tracer.CanQuery = false
+	tracer.CastShadow = false
+	tracer.Material = Enum.Material.Neon
+	tracer.Color = Color3.fromRGB(110, 210, 255)
+	tracer.Size = Vector3.new(0.08, 0.08, distance)
+	tracer.CFrame = CFrame.lookAt(startPosition, endPosition) * CFrame.new(0, 0, -distance / 2)
+	tracer.Parent = bulletsFolder
+
+	Debris:AddItem(tracer, 0.08)
+end
+
+local function findHandlePart(instance)
+	if not instance then
+		return nil
+	end
+
+	local directHandle = instance:FindFirstChild("Handle")
+	if directHandle and directHandle:IsA("BasePart") then
+		return directHandle
+	end
+
+	local handleAttachment = instance:FindFirstChild("HandleAttachment", true)
+	if handleAttachment and handleAttachment:IsA("Attachment") then
+		local parentPart = handleAttachment.Parent
+		if parentPart and parentPart:IsA("BasePart") then
+			parentPart.Name = "Handle"
+			return parentPart
+		end
+	end
+
+	local firstPart = instance:FindFirstChildWhichIsA("BasePart", true)
+	if firstPart then
+		firstPart.Name = "Handle"
+	end
+
+	return firstPart
+end
+
+local function hasWeldToHandle(part, handle)
+	for _, child in ipairs(part:GetChildren()) do
+		if child:IsA("WeldConstraint")
+			and (
+				(child.Part0 == handle and child.Part1 == part)
+				or (child.Part1 == handle and child.Part0 == part)
+			)
+		then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function prepareWeaponToolAsset(tool)
+	if not tool or not tool:IsA("Tool") then
+		return
+	end
+
+	local definition = getDefinitionByName(tool.Name)
+	if definition then
+		applyWeaponGrip(tool, definition)
+	end
+
+	local handle = findHandlePart(tool)
+	if not handle then
+		return
+	end
+
+	if handle.Parent ~= tool then
+		handle.Parent = tool
+	end
+
+	handle.Name = "Handle"
+	prepareVisualPart(handle)
+
+	tool.RequiresHandle = true
+	tool.CanBeDropped = false
+
+	for _, descendant in ipairs(tool:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			prepareVisualPart(descendant)
+
+			if descendant ~= handle and not hasWeldToHandle(descendant, handle) then
+				local weld = Instance.new("WeldConstraint")
+				weld.Part0 = handle
+				weld.Part1 = descendant
+				weld.Parent = descendant
+			end
+		end
+	end
+end
+
+local function convertModelWeaponToTool(model)
+	if not model or not model:IsA("Model") then
+		return model
+	end
+
+	local definition = getDefinitionByName(model.Name)
+	if not definition then
+		return model
+	end
+
+	local parent = model.Parent
+	if not parent then
+		return model
+	end
+
+	local tool = Instance.new("Tool")
+	tool.Name = definition.toolName
+	tool.CanBeDropped = false
+
+	for _, child in ipairs(model:GetChildren()) do
+		child.Parent = tool
+	end
+
+	prepareWeaponToolAsset(tool)
+	model:Destroy()
+	tool.Parent = parent
+	return tool
+end
+
+local function normalizeWeaponAsset(instance)
+	if not instance then
+		return nil
+	end
+
+	if normalizingInstances[instance] then
+		return instance
+	end
+
+	normalizingInstances[instance] = true
+
+	local definition = getDefinitionByName(instance.Name)
+	if not definition then
+		normalizingInstances[instance] = nil
+		return instance
+	end
+
+	if instance:IsA("Model") then
+		local convertedTool = convertModelWeaponToTool(instance)
+		normalizingInstances[instance] = nil
+		return convertedTool
+	end
+
+	if instance:IsA("Tool") then
+		prepareWeaponToolAsset(instance)
+	end
+
+	normalizingInstances[instance] = nil
+	return instance
+end
+
+local function normalizeWeaponAssetsInStarterPack()
+	for _, child in ipairs(StarterPack:GetChildren()) do
+		normalizeWeaponAsset(child)
+	end
+end
+
+local function findHumanoidFromInstance(instance)
+	local current = instance
+	while current do
+		if current:IsA("Model") then
+			local humanoid = current:FindFirstChildOfClass("Humanoid")
+			if humanoid then
+				return humanoid
+			end
+		end
+
+		current = current.Parent
+	end
+
+	return nil
+end
+
+local function isBrainrotVisual(instance)
+	local current = instance
+	while current and current ~= Workspace do
+		if current:GetAttribute("BrainrotApplied") then
+			return true
+		end
+
+		current = current.Parent
+	end
+
+	return false
+end
+
+local function shouldSkipPart(instance)
+	if not instance or instance:IsA("Terrain") or instance.Name == "Baseplate" then
+		return false
+	end
+
+	if findHumanoidFromInstance(instance) then
+		return false
+	end
+
+	if instance:FindFirstAncestorWhichIsA("Tool") then
+		return true
+	end
+
+	if instance.Name == "Bullet" or instance.Name == "Shell" or instance.Name == "HitboxTesterMarker" then
+		return true
+	end
+
+	if instance:IsA("BasePart") and instance.Transparency >= 0.95 then
+		return true
+	end
+
+	if isBrainrotVisual(instance) then
+		return true
+	end
+
+	return false
+end
+
+local function performRaycast(character, origin, direction, range)
+	local bulletsFolder = getBulletsFolder()
+	local filterList = { character }
+	if bulletsFolder then
+		table.insert(filterList, bulletsFolder)
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+
+	local unitDirection = direction.Unit
+	local currentOrigin = origin
+	local remainingRange = range
+
+	for _ = 1, 8 do
+		params.FilterDescendantsInstances = filterList
+
+		local result = Workspace:Raycast(currentOrigin, unitDirection * remainingRange, params)
+		if not result then
+			return nil
+		end
+
+		if not shouldSkipPart(result.Instance) then
+			return result
+		end
+
+		table.insert(filterList, result.Instance)
+
+		local travelled = (result.Position - origin).Magnitude
+		remainingRange = range - travelled
+		if remainingRange <= 0.05 then
+			break
+		end
+
+		currentOrigin = result.Position + unitDirection * 0.05
+	end
+
+	return nil
+end
+
+local function applySpread(direction, spreadAngleDegrees)
+	if not spreadAngleDegrees or spreadAngleDegrees <= 0 then
+		return direction.Unit
+	end
+
+	local spreadRadians = math.rad(spreadAngleDegrees)
+	local pitch = (math.random() * 2 - 1) * spreadRadians
+	local yaw = (math.random() * 2 - 1) * spreadRadians
+	local lookCFrame = CFrame.new(Vector3.zero, direction.Unit)
+	return (lookCFrame * CFrame.Angles(pitch, yaw, 0)).LookVector
+end
+
+local function getDamageForHit(definition, origin, hitPosition)
+	local baseDamage = definition.damage or 0
+	if baseDamage <= 0 then
+		return 0
+	end
+
+	local fullDamageRange = definition.fullDamageRange
+	local falloffEndRange = definition.damageFalloffEndRange or definition.range
+	local minDamageMultiplier = definition.minDamageMultiplier or 1
+	if not fullDamageRange or not falloffEndRange or falloffEndRange <= fullDamageRange then
+		return baseDamage
+	end
+
+	local distance = (hitPosition - origin).Magnitude
+	if distance <= fullDamageRange then
+		return baseDamage
+	end
+
+	local alpha = math.clamp((distance - fullDamageRange) / (falloffEndRange - fullDamageRange), 0, 1)
+	local damageMultiplier = 1 + (minDamageMultiplier - 1) * alpha
+	return baseDamage * damageMultiplier
+end
+
+local function resolveOrigin(character, clientOrigin)
+	local head = character:FindFirstChild("Head")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	local fallback = (head and head.Position) or (root and root.Position)
+	if not fallback then
+		return nil
+	end
+
+	if typeof(clientOrigin) ~= "Vector3" then
+		return fallback
+	end
+
+	local headDistance = head and (clientOrigin - head.Position).Magnitude or math.huge
+	local rootDistance = root and (clientOrigin - root.Position).Magnitude or math.huge
+	if math.min(headDistance, rootDistance) <= MAX_ORIGIN_DISTANCE then
+		return clientOrigin
+	end
+
+	return fallback
+end
+
+local function getToolOwner(tool)
+	local parent = tool and tool.Parent
+	if not parent then
+		return nil
+	end
+
+	if parent:IsA("Model") then
+		return Players:GetPlayerFromCharacter(parent)
+	end
+
+	if parent:IsA("Backpack") then
+		if parent.Parent and parent.Parent:IsA("Player") then
+			return parent.Parent
+		end
+
+		return parent.Parent and Players:FindFirstChild(parent.Parent.Name)
+	end
+
+	return nil
+end
+
+local function playerCanUseStandaloneWeapons(player)
+	if not player then
+		return false
+	end
+
+	local roundState = player:GetAttribute("TTTRoundState")
+	return roundState == "roundStart" or roundState == "roundActive"
+end
+
+local function getDefinition(tool)
+	if not tool then
+		return nil
+	end
+
+	return getDefinitionByName(tool.Name)
+end
+
+local function applyWeaponAttributes(tool, definition, ammo, isReloading)
+	tool:SetAttribute("TTTWeaponId", definition.toolName)
+	tool:SetAttribute("TTTDisplayName", definition.displayName or definition.toolName)
+	tool:SetAttribute("TTTAmmoInMagazine", ammo)
+	tool:SetAttribute("TTTClipSize", definition.clipSize)
+	tool:SetAttribute("TTTIsReloading", isReloading == true)
+	tool:SetAttribute("TTTFireCooldown", definition.fireCooldown)
+	tool:SetAttribute("TTTAutoFire", definition.autoFire == true)
+	tool:SetAttribute("TTTForceFirstPerson", definition.forceFirstPerson ~= false)
+	tool:SetAttribute("TTTUsesEmbeddedScripts", false)
+	tool:SetAttribute("TTTUseWeaponController", true)
+end
+
+local function syncAttributes(tool, state)
+	applyWeaponAttributes(tool, state.definition, state.ammo, state.isReloading)
+end
+
+local function initWeaponState(tool, definition)
+	if weaponStates[tool] then
+		syncAttributes(tool, weaponStates[tool])
+		return
+	end
+
+	local state = {
+		definition = definition,
+		ammo = definition.clipSize,
+		isReloading = false,
+		lastFireAt = 0,
+	}
+
+	weaponStates[tool] = state
+	syncAttributes(tool, state)
+end
+
+local function seedTemplateWeaponAttributes(tool)
+	if not tool or not tool:IsA("Tool") then
+		return
+	end
+
+	local definition = getDefinition(tool)
+	if not definition then
+		return
+	end
+
+	applyWeaponAttributes(tool, definition, definition.clipSize, false)
+end
+
+local function cleanupWeaponState(tool)
+	weaponStates[tool] = nil
+end
+
+local function watchTool(tool)
+	tool = normalizeWeaponAsset(tool)
+	if not tool or not tool:IsA("Tool") then
+		return
+	end
+
+	if watchedTools[tool] then
+		return
+	end
+
+	watchedTools[tool] = true
+	prepareWeaponToolAsset(tool)
+
+	local definition = getDefinition(tool)
+	if not definition then
+		watchedTools[tool] = nil
+		return
+	end
+
+	if tool:GetAttribute("TTTWeaponHandlerBound") then
+		initWeaponState(tool, definition)
+		return
+	end
+
+	tool:SetAttribute("TTTWeaponHandlerBound", true)
+	initWeaponState(tool, definition)
+
+	tool.Destroying:Connect(function()
+		cleanupWeaponState(tool)
+		watchedTools[tool] = nil
+	end)
+end
+
+local function tagHumanoidKiller(humanoid, player)
+	local existingTag = humanoid:FindFirstChild("creator")
+	if existingTag then
+		existingTag:Destroy()
+	end
+
+	local creatorTag = Instance.new("ObjectValue")
+	creatorTag.Name = "creator"
+	creatorTag.Value = player
+	creatorTag.Parent = humanoid
+	Debris:AddItem(creatorTag, 2)
+end
+
+local function handleFire(player, tool, clientOrigin, direction)
+	if typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then
+		return
+	end
+
+	if not playerCanUseStandaloneWeapons(player) then
+		return
+	end
+
+	if not tool or not tool:IsA("Tool") or tool.Parent ~= player.Character then
+		return
+	end
+
+	local state = weaponStates[tool]
+	if not state then
+		watchTool(tool)
+		state = weaponStates[tool]
+	end
+	if not state or getToolOwner(tool) ~= player then
+		return
+	end
+
+	local character = player.Character
+	local shooterHumanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not shooterHumanoid or shooterHumanoid.Health <= 0 or state.isReloading then
+		return
+	end
+
+	local now = os.clock()
+	if now - state.lastFireAt < state.definition.fireCooldown then
+		return
+	end
+
+	if state.ammo <= 0 then
+		return
+	end
+
+	local origin = resolveOrigin(character, clientOrigin)
+	if not origin then
+		return
+	end
+
+	state.lastFireAt = now
+	state.ammo -= 1
+	syncAttributes(tool, state)
+
+	local pellets = state.definition.pellets or 1
+	local spreadAngle = state.definition.spreadAngle or 0
+
+	for _ = 1, pellets do
+		local shotDirection = applySpread(direction, spreadAngle)
+		local result = performRaycast(character, origin, shotDirection, state.definition.range)
+		local hitPosition = result and result.Position or (origin + shotDirection.Unit * state.definition.range)
+		local tracerOrigin = getShotVisualOrigin(tool, origin)
+		local tracerForwardOffset = state.definition.tracerForwardOffset or 0
+		if tracerForwardOffset > 0 then
+			tracerOrigin = tracerOrigin + shotDirection.Unit * tracerForwardOffset
+		end
+		createTracer(tracerOrigin, hitPosition, state.definition)
+		if not result then
+			continue
+		end
+
+		local targetHumanoid = findHumanoidFromInstance(result.Instance)
+		if not targetHumanoid or targetHumanoid == shooterHumanoid or targetHumanoid.Health <= 0 then
+			continue
+		end
+
+		local targetCharacter = targetHumanoid.Parent
+		if targetCharacter == character then
+			continue
+		end
+
+		tagHumanoidKiller(targetHumanoid, player)
+		targetHumanoid:TakeDamage(getDamageForHit(state.definition, origin, result.Position))
+	end
+end
+
+local function handleReload(player, tool)
+	if not tool or not tool:IsA("Tool") then
+		return
+	end
+
+	if not playerCanUseStandaloneWeapons(player) then
+		return
+	end
+
+	local state = weaponStates[tool]
+	if not state then
+		watchTool(tool)
+		state = weaponStates[tool]
+	end
+	if not state or getToolOwner(tool) ~= player then
+		return
+	end
+
+	if state.isReloading or state.ammo >= state.definition.clipSize then
+		return
+	end
+
+	state.isReloading = true
+	syncAttributes(tool, state)
+
+	task.delay(state.definition.reloadTime, function()
+		if weaponStates[tool] ~= state then
+			return
+		end
+
+		if getToolOwner(tool) ~= player then
+			return
+		end
+
+		state.isReloading = false
+		state.ammo = state.definition.clipSize
+		syncAttributes(tool, state)
+	end)
+end
+
+normalizeWeaponAssetsInStarterPack()
+for _, child in ipairs(StarterPack:GetChildren()) do
+	seedTemplateWeaponAttributes(child)
+end
+StarterPack.ChildAdded:Connect(function(child)
+	task.defer(function()
+		local normalized = normalizeWeaponAsset(child)
+		seedTemplateWeaponAttributes(normalized)
+	end)
+end)
+
+WeaponRemote.OnServerEvent:Connect(function(player, action, tool, originOrDirection, direction)
+	if action == "fire" then
+		if typeof(originOrDirection) == "Vector3" and typeof(direction) ~= "Vector3" then
+			handleFire(player, tool, nil, originOrDirection)
+		else
+			handleFire(player, tool, originOrDirection, direction)
+		end
+		return
+	end
+
+	if action == "reload" then
+		handleReload(player, tool)
+	end
+end)
+
+local function watchPlayer(player)
+	local function watchCharacter(character)
+		if not character then
+			return
+		end
+
+		for _, child in character:GetChildren() do
+			if child:IsA("Tool") then
+				watchTool(child)
+			end
+		end
+	end
+
+	player.CharacterAdded:Connect(watchCharacter)
+	if player.Character then
+		watchCharacter(player.Character)
+	end
+
+	local backpack = player:WaitForChild("Backpack", 10)
+	if backpack then
+		for _, child in backpack:GetChildren() do
+			if child:IsA("Tool") then
+				watchTool(child)
+			end
+		end
+
+		backpack.ChildAdded:Connect(function(child)
+			if child:IsA("Tool") then
+				task.defer(watchTool, child)
+			end
+		end)
+	end
+end
+
+Players.PlayerAdded:Connect(watchPlayer)
+
+for _, player in Players:GetPlayers() do
+	watchPlayer(player)
+end
