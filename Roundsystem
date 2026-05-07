@@ -1,0 +1,2876 @@
+-- ============================================
+-- TTT Rundensystem - Server Script
+-- Steuert: Wartephase -> Runde -> Rundenende
+-- Extras: Brainrot-Auswahl, Morph-Preview, Debug-Kill
+-- ============================================
+
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerStorage = game:GetService("ServerStorage")
+local StarterPlayer = game:GetService("StarterPlayer")
+local TeleportService = game:GetService("TeleportService")
+local Workspace = game:GetService("Workspace")
+
+local function createFallbackLocalization()
+	local values = {
+		["common.random"] = "Random",
+		["common.unknown"] = "Unknown",
+		["role.alignment.traitor"] = "a Traitor",
+		["role.alignment.innocent"] = "an Innocent",
+		["corpse.promptAction"] = "Identify",
+		["corpse.promptObject"] = "Corpse",
+		["corpse.identified"] = "{playerName} was {alignment}!",
+		["round.waitingForPlayers"] = "Waiting for players... ({playerCount}/{minPlayers})",
+		["round.tooManyPlayers"] = "Too many players for a round ({playerCount}/{maxPlayers})",
+		["round.nextRoundIn"] = "Next round in",
+		["round.started"] = "Round started!",
+		["round.inProgress"] = "Round in progress",
+		["round.ending.innocentsWin"] = "Innocents win!",
+		["round.ending.traitorsWin"] = "Traitors win!",
+		["brainrot.messages.chooseForNextRound"] = "Choose your Brainrot for the next round.",
+		["brainrot.messages.selectionLockedDuringRound"] = "Selection is locked during the round.",
+		["brainrot.messages.unknown"] = "Unknown Brainrot.",
+		["brainrot.messages.selected"] = "Selected: {name}",
+		["brainrot.messages.roundStarting"] = "Selection locked. Round starting.",
+		["brainrot.options.TralaleroTralala.description"] = "Fast. Loud. Runner.",
+		["brainrot.options.TralaleroTralala.bonus"] = "Sprint faster!",
+		["brainrot.options.BombardiroCrocodilo.description"] = "Chaotic. Tough. Heavy.",
+		["brainrot.options.BombardiroCrocodilo.bonus"] = "More health!",
+		["brainrot.options.TungTungTungSahur.description"] = "Alarm. Jump. All-rounder.",
+		["brainrot.options.TungTungTungSahur.bonus"] = "Jump higher!",
+	}
+
+	return {
+		getText = function(_, key, params)
+			local template = values[key] or key
+			if not params then
+				return template
+			end
+
+			return string.gsub(template, "{([%w_]+)}", function(token)
+				local value = params[token]
+				if value == nil then
+					return "{" .. token .. "}"
+				end
+
+				return tostring(value)
+			end)
+		end,
+	}
+end
+
+local roundLocalizationModule = ReplicatedStorage:FindFirstChild("RoundLocalization") or ReplicatedStorage:FindFirstChild("RoundLocalization.luau")
+local RoundLocalization
+if roundLocalizationModule and roundLocalizationModule:IsA("ModuleScript") then
+	RoundLocalization = require(roundLocalizationModule)
+else
+	RoundLocalization = createFallbackLocalization()
+end
+
+local RUN_LOCK_ATTRIBUTE = "TTTRoundSystemRunning"
+
+if game:GetAttribute(RUN_LOCK_ATTRIBUTE) then
+	warn("TTT Rundensystem laeuft bereits. Dieses Skript beendet sich, damit keine zwei Timer parallel laufen.")
+	return
+end
+
+game:SetAttribute(RUN_LOCK_ATTRIBUTE, true)
+
+script.Destroying:Connect(function()
+	if game:GetAttribute(RUN_LOCK_ATTRIBUTE) then
+		game:SetAttribute(RUN_LOCK_ATTRIBUTE, false)
+	end
+end)
+
+Players.CharacterAutoLoads = false
+
+local RoundEvent = ReplicatedStorage:WaitForChild("RoundEvent")
+
+local WeaponRemote = ReplicatedStorage:FindFirstChild("WeaponRemote")
+if not WeaponRemote then
+	WeaponRemote = Instance.new("RemoteEvent")
+	WeaponRemote.Name = "WeaponRemote"
+	WeaponRemote.Parent = ReplicatedStorage
+end
+
+local BrainrotEvent = ReplicatedStorage:FindFirstChild("BrainrotEvent")
+if not BrainrotEvent then
+	BrainrotEvent = Instance.new("RemoteEvent")
+	BrainrotEvent.Name = "BrainrotEvent"
+	BrainrotEvent.Parent = ReplicatedStorage
+end
+
+local brainrotAssetsFolder = ServerStorage:FindFirstChild("BrainrotAssets")
+if not brainrotAssetsFolder then
+	brainrotAssetsFolder = Instance.new("Folder")
+	brainrotAssetsFolder.Name = "BrainrotAssets"
+	brainrotAssetsFolder.Parent = ServerStorage
+end
+
+local brainrotPreviewFolder = ReplicatedStorage:FindFirstChild("BrainrotPreviewAssets")
+if not brainrotPreviewFolder then
+	brainrotPreviewFolder = Instance.new("Folder")
+	brainrotPreviewFolder.Name = "BrainrotPreviewAssets"
+	brainrotPreviewFolder.Parent = ReplicatedStorage
+end
+
+local corpseAssetsFolder = ServerStorage:FindFirstChild("CorpseAssets")
+if not corpseAssetsFolder then
+	corpseAssetsFolder = Instance.new("Folder")
+	corpseAssetsFolder.Name = "CorpseAssets"
+	corpseAssetsFolder.Parent = ServerStorage
+end
+
+local bulletsFolder = Workspace:FindFirstChild("BulletsFolder")
+if not bulletsFolder then
+	bulletsFolder = Instance.new("Folder")
+	bulletsFolder.Name = "BulletsFolder"
+	bulletsFolder.Parent = Workspace
+end
+
+-- Einstellungen
+local MIN_PLAYERS = 4
+local ALLOW_SOLO_ROUND_START = true
+local MAX_PLAYERS = 10
+local INTERMISSION_TIME = 15
+local ROUND_TIME = 180
+local POST_ROUND_RETURN_DELAY = 5
+local LOBBY_PLACE_ID = 74960574968470
+local DEBUG_SOLO_RETURN_TEST_ENABLED = false
+local DEBUG_SOLO_ROUND_TIME = 8
+local DEBUG_KILL_BUTTON_ENABLED = true
+local DISABLE_DEFAULT_HEALTH_REGEN = true
+local SHARED_CORPSE_ASSET_NAME = "SharedCorpseAsset"
+local CORPSE_IDENTIFY_KEY = Enum.KeyCode.E
+local CORPSE_IDENTIFY_DISTANCE = 10
+local CORPSE_IDENTIFY_HOLD_DURATION = 0.35
+local CORPSE_IDENTIFIED_DESPAWN_DELAY = 0.15
+local CORPSE_FALL_DURATION = 0.32
+local CORPSE_FALL_ANGLE = math.rad(90)
+local CORPSE_GROUND_CLEARANCE = 0.15
+local DAMAGE_FLASH_DURATION = 0.16
+local DEFAULT_SIDEARM_TOOL_NAME = "ServicePistol"
+local DEFAULT_SIDEARM_ENABLED = false
+local DEBUG_HITSCAN_TEST_WEAPON_ENABLED = true
+local DEBUG_HITSCAN_TOOL_NAME = "HitboxTester"
+local DEBUG_HITSCAN_MARKERS_ENABLED = true
+local MAX_CLIENT_FIRE_ORIGIN_DISTANCE = 80
+local WEAPON_ASSETS_FOLDER_NAME = "WeaponAssets"
+
+local WEAPON_DEFINITIONS = {
+	[DEBUG_HITSCAN_TOOL_NAME] = {
+		weaponId = "hitbox_tester",
+		toolName = DEBUG_HITSCAN_TOOL_NAME,
+		displayName = "Hitbox Tester",
+		forceFirstPerson = true,
+		damage = 10,
+		clipSize = 999,
+		fireCooldown = 0.08,
+		reloadTime = 0.1,
+		range = 1000,
+	},
+}
+
+if DEFAULT_SIDEARM_ENABLED then
+	WEAPON_DEFINITIONS[DEFAULT_SIDEARM_TOOL_NAME] = {
+		weaponId = "service_pistol",
+		toolName = DEFAULT_SIDEARM_TOOL_NAME,
+		displayName = "Service Pistol",
+		forceGeneratedPrototype = true,
+		forceFirstPerson = true,
+		visualAssetNames = { "ServicePistol", "Handgun", "PistolModel" },
+		damage = 18,
+		clipSize = 7,
+		fireCooldown = 1 / 5.5,
+		reloadTime = 2,
+		range = 1000,
+	}
+end
+
+local BRAINROTS = {
+	TralaleroTralala = {
+		order = 1,
+		displayName = "Tralalero Tralala",
+		descriptionKey = "brainrot.options.TralaleroTralala.description",
+		bonusKey = "brainrot.options.TralaleroTralala.bonus",
+		uiColor = Color3.fromRGB(90, 220, 255),
+		walkSpeed = 20,
+		maxHealth = 100,
+		jumpPower = 50,
+		jumpHeight = 7.2,
+		kit = { "SneakerBurst" },
+		traitorKit = { "QuickKnife" },
+		assetName = "TralaleroTralala",
+		matchVisualScaleOf = "BombardiroCrocodilo",
+		rigidVisual = true,
+		assetOffset = CFrame.new(0, 0.55, -1.6),
+	},
+	BombardiroCrocodilo = {
+		order = 2,
+		displayName = "Bombardiro Crocodilo",
+		descriptionKey = "brainrot.options.BombardiroCrocodilo.description",
+		bonusKey = "brainrot.options.BombardiroCrocodilo.bonus",
+		uiColor = Color3.fromRGB(255, 170, 60),
+		walkSpeed = 14,
+		maxHealth = 150,
+		jumpPower = 45,
+		jumpHeight = 6.5,
+		kit = { "KnockbackBomb" },
+		traitorKit = { "BigBomb" },
+		assetName = "BombardiroCrocodilo",
+		assetScale = 0.08,
+		rigidVisual = true,
+		rigidVisualTargetNames = { "HumanoidRootPart" },
+		assetOffset = CFrame.new(0, -0.9, 0),
+	},
+	TungTungTungSahur = {
+		order = 3,
+		displayName = "Tung Tung Tung Sahur",
+		descriptionKey = "brainrot.options.TungTungTungSahur.description",
+		bonusKey = "brainrot.options.TungTungTungSahur.bonus",
+		uiColor = Color3.fromRGB(255, 90, 120),
+		walkSpeed = 16,
+		maxHealth = 100,
+		jumpPower = 62,
+		jumpHeight = 9,
+		kit = { "DrumBat" },
+		traitorKit = { "HunterBat" },
+		assetName = "TungTungTungSahur",
+		assetOffset = CFrame.new(0, 0.4, 0),
+		visualMotionStyle = "GoofyWalk",
+	},
+}
+
+-- Zustand
+local roundActive = false
+local roundWinner = ""
+local playerRoles = {}
+local deadPlayers = {}
+local deathConnections = {}
+local countdownToken = 0
+local selectedBrainrots = {}
+local activeRoundBrainrots = {}
+local characterConnections = {}
+local previewSyncQueued = false
+local resolvedAssetScales = {}
+local visualAnimationConnections = {}
+local characterCombatConnections = {}
+local damageFlashTokens = {}
+local spawnedCorpses = {}
+local weaponStates = {}
+local weaponConnections = {}
+local pendingHealthScriptRemovals = setmetatable({}, { __mode = "k" })
+local getRoleDistribution
+local clearBrainrotHitboxes
+
+local endRound
+
+local function getTeleportablePlayers()
+	local teleportablePlayers = {}
+
+	for _, player in Players:GetPlayers() do
+		if player.Parent == Players then
+			table.insert(teleportablePlayers, player)
+		end
+	end
+
+	return teleportablePlayers
+end
+
+local function isSoloReturnTest()
+	return DEBUG_SOLO_RETURN_TEST_ENABLED and #Players:GetPlayers() == 1
+end
+
+local function returnPlayersToLobby()
+	if RunService:IsStudio() then
+		warn("Rueckkehr zur Lobby wird in Studio uebersprungen. Verwende den Roblox Player fuer echte Teleport-Tests.")
+		return false
+	end
+
+	if LOBBY_PLACE_ID <= 0 then
+		warn("LOBBY_PLACE_ID ist ungueltig. Spieler bleiben nach dem Match im MatchPlace.")
+		return false
+	end
+
+	local teleportablePlayers = getTeleportablePlayers()
+	if #teleportablePlayers == 0 then
+		return true
+	end
+
+	local teleportOptions = Instance.new("TeleportOptions")
+	teleportOptions:SetTeleportData({
+		returnedFromMatch = true,
+		winner = roundWinner,
+		returnedAt = os.time(),
+	})
+
+	local success, result = pcall(function()
+		return TeleportService:TeleportAsync(LOBBY_PLACE_ID, teleportablePlayers, teleportOptions)
+	end)
+
+	if not success then
+		warn("Rueckkehr zur Lobby fehlgeschlagen: " .. tostring(result))
+		return false
+	end
+
+	return true
+end
+
+local function disconnectVisualAnimation(character)
+	local connection = visualAnimationConnections[character]
+	if connection then
+		connection:Disconnect()
+		visualAnimationConnections[character] = nil
+	end
+end
+
+local function ensureHealthRegenOverrideScript()
+	if not DISABLE_DEFAULT_HEALTH_REGEN then
+		return
+	end
+
+	local starterCharacterScripts = StarterPlayer:FindFirstChild("StarterCharacterScripts")
+	if not starterCharacterScripts then
+		return
+	end
+
+	local healthScript = starterCharacterScripts:FindFirstChild("Health")
+	if healthScript and not healthScript:IsA("Script") then
+		healthScript:Destroy()
+		healthScript = nil
+	end
+
+	if not healthScript then
+		healthScript = Instance.new("Script")
+		healthScript.Name = "Health"
+		healthScript.Parent = starterCharacterScripts
+	end
+
+	healthScript:SetAttribute("TTTDisableDefaultRegen", true)
+end
+
+local function disconnectCharacterCombatEffects(character)
+	local connections = characterCombatConnections[character]
+	if connections then
+		for _, connection in ipairs(connections) do
+			connection:Disconnect()
+		end
+
+		characterCombatConnections[character] = nil
+	end
+
+	damageFlashTokens[character] = nil
+
+	local existingFlash = character and character:FindFirstChild("TTTDamageFlash")
+	if existingFlash then
+		existingFlash:Destroy()
+	end
+end
+
+local function getDamageFlashAdornee(character)
+	for _, child in ipairs(character:GetChildren()) do
+		if child:GetAttribute("BrainrotApplied") and child:IsA("Model") then
+			return child
+		end
+	end
+
+	for _, child in ipairs(character:GetChildren()) do
+		if child:GetAttribute("BrainrotApplied") and child:IsA("BasePart") then
+			return child
+		end
+	end
+
+	return character
+end
+
+local function flashCharacterDamage(character)
+	if not character or character.Parent == nil then
+		return
+	end
+
+	local token = (damageFlashTokens[character] or 0) + 1
+	damageFlashTokens[character] = token
+
+	local existingFlash = character:FindFirstChild("TTTDamageFlash")
+	if existingFlash then
+		existingFlash:Destroy()
+	end
+
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "TTTDamageFlash"
+	highlight.Adornee = getDamageFlashAdornee(character)
+	highlight.DepthMode = Enum.HighlightDepthMode.Occluded
+	highlight.FillColor = Color3.fromRGB(255, 70, 70)
+	highlight.FillTransparency = 0.28
+	highlight.OutlineColor = Color3.fromRGB(255, 120, 120)
+	highlight.OutlineTransparency = 0.65
+	highlight.Parent = character
+
+	Debris:AddItem(highlight, DAMAGE_FLASH_DURATION + 0.05)
+
+	task.delay(DAMAGE_FLASH_DURATION, function()
+		if damageFlashTokens[character] ~= token then
+			return
+		end
+
+		if highlight.Parent then
+			highlight:Destroy()
+		end
+	end)
+end
+
+local function attachCharacterCombatEffects(character)
+	disconnectCharacterCombatEffects(character)
+
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+
+	local previousHealth = humanoid.Health
+	local connections = {}
+
+	local function removeDefaultHealthScript(scriptInstance)
+		if not DISABLE_DEFAULT_HEALTH_REGEN then
+			return
+		end
+
+		if not scriptInstance or not scriptInstance:IsA("Script") or scriptInstance.Name ~= "Health" then
+			return
+		end
+
+		if scriptInstance:GetAttribute("TTTDisableDefaultRegen") then
+			return
+		end
+
+		if pendingHealthScriptRemovals[scriptInstance] then
+			return
+		end
+
+		pendingHealthScriptRemovals[scriptInstance] = true
+		task.defer(function()
+			if scriptInstance and scriptInstance.Parent and not scriptInstance:GetAttribute("TTTDisableDefaultRegen") then
+				scriptInstance.Disabled = true
+				scriptInstance:SetAttribute("TTTDisableDefaultRegen", true)
+			end
+
+			pendingHealthScriptRemovals[scriptInstance] = nil
+		end)
+	end
+
+	removeDefaultHealthScript(character:FindFirstChild("Health"))
+	task.spawn(function()
+		for _ = 1, 20 do
+			if not character.Parent then
+				break
+			end
+
+			local healthScript = character:FindFirstChild("Health")
+			if healthScript then
+				removeDefaultHealthScript(healthScript)
+				if healthScript:GetAttribute("TTTDisableDefaultRegen") or healthScript.Disabled then
+					break
+				end
+			end
+
+			task.wait(0.25)
+		end
+	end)
+	table.insert(connections, humanoid.HealthChanged:Connect(function(currentHealth)
+		if currentHealth < previousHealth - 0.05 then
+			flashCharacterDamage(character)
+		end
+
+		previousHealth = currentHealth
+	end))
+	table.insert(connections, character.AncestryChanged:Connect(function(_, parent)
+		if parent == nil then
+			disconnectCharacterCombatEffects(character)
+		end
+	end))
+
+	characterCombatConnections[character] = connections
+end
+
+local function beginNewCountdown()
+	countdownToken += 1
+	return countdownToken
+end
+
+local function t(target, key, params)
+	return RoundLocalization.getText(target, key, params)
+end
+
+local function cloneMap(source)
+	local clone = {}
+
+	if not source then
+		return clone
+	end
+
+	for key, value in pairs(source) do
+		clone[key] = value
+	end
+
+	return clone
+end
+
+local function resolveMessageParams(player, messageParams)
+	if type(messageParams) == "function" then
+		return messageParams(player)
+	end
+
+	return messageParams
+end
+
+local function fireRoundEvent(player, state, data, messageKey, messageParams)
+	local payload = cloneMap(data)
+
+	if messageKey then
+		payload.message = t(player, messageKey, resolveMessageParams(player, messageParams))
+	end
+
+	player:SetAttribute("TTTRoundState", state)
+
+	RoundEvent:FireClient(player, state, payload)
+end
+
+local function broadcastLocalized(state, data, messageKey, messageParams)
+	for _, player in Players:GetPlayers() do
+		fireRoundEvent(player, state, data, messageKey, messageParams)
+	end
+end
+
+local function getRandomBrainrotId()
+	local brainrotIds = {}
+
+	for brainrotId in BRAINROTS do
+		table.insert(brainrotIds, brainrotId)
+	end
+
+	if #brainrotIds == 0 then
+		return nil
+	end
+
+	return brainrotIds[math.random(1, #brainrotIds)]
+end
+
+local function getSelectedBrainrotId(player)
+	local brainrotId = selectedBrainrots[player]
+	if brainrotId and not BRAINROTS[brainrotId] then
+		selectedBrainrots[player] = nil
+		brainrotId = nil
+	end
+	return brainrotId
+end
+
+local function getActiveBrainrotId(player)
+	local brainrotId = activeRoundBrainrots[player]
+	if brainrotId and not BRAINROTS[brainrotId] then
+		activeRoundBrainrots[player] = nil
+		brainrotId = nil
+	end
+	return brainrotId
+end
+
+local function getEffectiveBrainrotId(player)
+	return getActiveBrainrotId(player) or getSelectedBrainrotId(player)
+end
+
+local function buildBrainrotOptions(player)
+	local options = {}
+
+	for id, config in BRAINROTS do
+		table.insert(options, {
+			id = id,
+			displayName = config.displayName,
+			description = t(player, config.descriptionKey),
+			bonusText = t(player, config.bonusKey),
+			uiColor = config.uiColor,
+			order = config.order,
+		})
+	end
+
+	table.sort(options, function(left, right)
+		return left.order < right.order
+	end)
+
+	return options
+end
+
+local function sendBrainrotState(player, messageKey, messageParams)
+	local brainrotId = getEffectiveBrainrotId(player)
+	local config = brainrotId and BRAINROTS[brainrotId] or nil
+
+	BrainrotEvent:FireClient(player, "sync", {
+		options = buildBrainrotOptions(player),
+		selectedId = brainrotId,
+		selectedName = config and config.displayName or t(player, "common.random"),
+		hasSelection = brainrotId ~= nil,
+		locked = roundActive,
+		message = messageKey and t(player, messageKey, messageParams) or "",
+	})
+end
+
+local function syncBrainrotStateForAll(messageKey, messageParams)
+	for _, player in Players:GetPlayers() do
+		sendBrainrotState(player, messageKey, messageParams)
+	end
+end
+
+local function getWeaponDefinitionByTool(tool)
+	if not tool or not tool:IsA("Tool") then
+		return nil
+	end
+
+	local weaponId = tool:GetAttribute("TTTWeaponId")
+	for _, definition in pairs(WEAPON_DEFINITIONS) do
+		if definition.weaponId == weaponId or definition.toolName == tool.Name then
+			return definition
+		end
+	end
+
+	return nil
+end
+
+local function disconnectWeaponState(tool)
+	local connections = weaponConnections[tool]
+	if connections then
+		for _, connection in ipairs(connections) do
+			connection:Disconnect()
+		end
+		weaponConnections[tool] = nil
+	end
+
+	weaponStates[tool] = nil
+end
+
+local function syncWeaponAttributes(tool, state)
+	if not tool or not state then
+		return
+	end
+
+	tool:SetAttribute("TTTWeaponId", state.definition.weaponId)
+	tool:SetAttribute("TTTDisplayName", state.definition.displayName)
+	tool:SetAttribute("TTTClipSize", state.definition.clipSize)
+	tool:SetAttribute("TTTAmmoInMagazine", state.ammo)
+	tool:SetAttribute("TTTIsReloading", state.isReloading == true)
+end
+
+local function isIgnoredWeaponAssetChild(instance)
+	if not instance then
+		return true
+	end
+
+	return instance.Name == "READ ME"
+		or instance.Name == "ThumbnailCamera"
+end
+
+local function findWeaponVisualAsset(definition)
+	local weaponAssetsFolder = ServerStorage:FindFirstChild(WEAPON_ASSETS_FOLDER_NAME)
+
+	local assetNames = {}
+	local seenAssetNames = {}
+
+	local function appendAssetName(assetName)
+		if typeof(assetName) ~= "string" or assetName == "" or seenAssetNames[assetName] then
+			return
+		end
+
+		seenAssetNames[assetName] = true
+		table.insert(assetNames, assetName)
+	end
+
+	appendAssetName(definition.toolName)
+	if typeof(definition.visualAssetName) == "string" and definition.visualAssetName ~= "" then
+		appendAssetName(definition.visualAssetName)
+	end
+	if typeof(definition.visualAssetNames) == "table" then
+		for _, assetName in ipairs(definition.visualAssetNames) do
+			appendAssetName(assetName)
+		end
+	end
+
+	for _, assetName in ipairs(assetNames) do
+		local asset = weaponAssetsFolder and weaponAssetsFolder:FindFirstChild(assetName, true)
+		if not asset then
+			asset = ServerStorage:FindFirstChild(assetName, true)
+		end
+		if asset then
+			return asset
+		end
+	end
+
+	return nil
+end
+
+local function markGeneratedWeaponVisual(instance)
+	if not instance then
+		return
+	end
+
+	instance:SetAttribute("TTTGeneratedWeaponVisual", true)
+	for _, descendant in ipairs(instance:GetDescendants()) do
+		descendant:SetAttribute("TTTGeneratedWeaponVisual", true)
+	end
+end
+
+local function clearGeneratedWeaponVisual(tool)
+	for _, child in ipairs(tool:GetChildren()) do
+		if child:GetAttribute("TTTGeneratedWeaponVisual") then
+			child:Destroy()
+		end
+	end
+end
+
+local function prepareWeaponVisualPart(part)
+	if not part or not part:IsA("BasePart") then
+		return
+	end
+
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.Massless = true
+	part.CastShadow = false
+	part.Anchored = false
+end
+
+local function attachWeaponVisual(tool, definition)
+	clearGeneratedWeaponVisual(tool)
+
+	local asset = findWeaponVisualAsset(definition)
+	if not asset then
+		return
+	end
+
+	if asset:IsA("Tool") then
+		local handleClone = nil
+		tool.TextureId = asset.TextureId
+
+		for _, child in ipairs(asset:GetChildren()) do
+			if isIgnoredWeaponAssetChild(child) then
+				continue
+			end
+
+			local clone = child:Clone()
+			if clone:IsA("BasePart") then
+				prepareWeaponVisualPart(clone)
+			end
+
+			clone.Parent = tool
+			markGeneratedWeaponVisual(clone)
+
+			if clone.Name == "Handle" and clone:IsA("BasePart") then
+				handleClone = clone
+			end
+		end
+
+		if handleClone then
+			for _, descendant in ipairs(tool:GetDescendants()) do
+				if descendant:IsA("BasePart")
+					and descendant ~= handleClone
+					and descendant:GetAttribute("TTTGeneratedWeaponVisual")
+				then
+					prepareWeaponVisualPart(descendant)
+
+					local weld = Instance.new("WeldConstraint")
+					weld.Part0 = handleClone
+					weld.Part1 = descendant
+					weld.Parent = descendant
+					markGeneratedWeaponVisual(weld)
+				end
+			end
+
+			tool.Grip = asset.Grip
+		end
+
+		return
+	end
+
+	if asset:IsA("BasePart") then
+		local handle = asset:Clone()
+		handle.Name = "Handle"
+		prepareWeaponVisualPart(handle)
+		handle.Transparency = asset.Transparency
+		handle.Parent = tool
+		markGeneratedWeaponVisual(handle)
+		return
+	end
+
+	local visualClone = asset:Clone()
+	local referencePart = visualClone:IsA("Model")
+		and (visualClone.PrimaryPart or visualClone:FindFirstChildWhichIsA("BasePart", true))
+		or visualClone:FindFirstChildWhichIsA("BasePart", true)
+
+	if not referencePart then
+		visualClone:Destroy()
+		return
+	end
+
+	visualClone.Name = definition.visualAssetName
+	visualClone.Parent = tool
+	markGeneratedWeaponVisual(visualClone)
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(
+		math.max(referencePart.Size.X, 0.2),
+		math.max(referencePart.Size.Y, 0.2),
+		math.max(referencePart.Size.Z, 0.2)
+	)
+	handle.CFrame = referencePart.CFrame
+	handle.Transparency = 1
+	prepareWeaponVisualPart(handle)
+	handle.Parent = tool
+	markGeneratedWeaponVisual(handle)
+
+	for _, descendant in ipairs(visualClone:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			prepareWeaponVisualPart(descendant)
+
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = handle
+			weld.Part1 = descendant
+			weld.Parent = descendant
+			markGeneratedWeaponVisual(weld)
+		end
+	end
+end
+
+local function weaponPrototypeHasEmbeddedScripts(tool)
+	return tool
+		and tool:IsA("Tool")
+		and (
+			tool:FindFirstChildWhichIsA("LocalScript", true) ~= nil
+			or tool:FindFirstChildWhichIsA("Script", true) ~= nil
+		)
+end
+
+local function configureWeaponPrototype(tool, definition)
+	local usesEmbeddedScripts = weaponPrototypeHasEmbeddedScripts(tool)
+	local hasHandle = tool:FindFirstChild("Handle") ~= nil
+
+	tool.Name = definition.toolName
+	tool.RequiresHandle = hasHandle
+	tool.CanBeDropped = false
+	tool.ManualActivationOnly = false
+	tool.ToolTip = definition.displayName
+	tool:SetAttribute("TTTWeaponPrototype", true)
+	tool:SetAttribute("TTTWeaponId", definition.weaponId)
+	tool:SetAttribute("TTTDisplayName", definition.displayName)
+	tool:SetAttribute("TTTForceFirstPerson", definition.forceFirstPerson == true)
+	tool:SetAttribute("TTTUsesEmbeddedScripts", usesEmbeddedScripts)
+
+	tool:SetAttribute("TTTClipSize", definition.clipSize)
+	tool:SetAttribute("TTTAmmoInMagazine", definition.clipSize)
+	tool:SetAttribute("TTTIsReloading", false)
+end
+
+local function ensureWeaponPrototypes()
+	for _, definition in pairs(WEAPON_DEFINITIONS) do
+		local existingTool = ServerStorage:FindFirstChild(definition.toolName)
+		if existingTool and not existingTool:IsA("Tool") then
+			existingTool:Destroy()
+			existingTool = nil
+		end
+
+		if existingTool
+			and definition.forceGeneratedPrototype
+			and not weaponPrototypeHasEmbeddedScripts(existingTool)
+		then
+			-- Only replace plain/generated prototypes; scripted tools are preserved intact.
+			existingTool:Destroy()
+			existingTool = nil
+		end
+
+		if not existingTool then
+			local asset = findWeaponVisualAsset(definition)
+			if asset and asset:IsA("Tool") then
+				existingTool = asset:Clone()
+			else
+				existingTool = Instance.new("Tool")
+				attachWeaponVisual(existingTool, definition)
+			end
+
+			existingTool.Parent = ServerStorage
+		end
+
+		configureWeaponPrototype(existingTool, definition)
+	end
+end
+
+local function initializeWeaponInstance(tool)
+	local definition = getWeaponDefinitionByTool(tool)
+	if not definition then
+		return
+	end
+
+	configureWeaponPrototype(tool, definition)
+	disconnectWeaponState(tool)
+
+	local state = {
+		definition = definition,
+		ammo = definition.clipSize,
+		isReloading = false,
+		lastFireAt = 0,
+	}
+
+	weaponStates[tool] = state
+	syncWeaponAttributes(tool, state)
+
+	weaponConnections[tool] = {
+		tool.Destroying:Connect(function()
+			disconnectWeaponState(tool)
+		end),
+	}
+end
+
+local function getToolOwner(tool)
+	if not tool or not tool:IsA("Tool") then
+		return nil
+	end
+
+	local parent = tool.Parent
+	if not parent then
+		return nil
+	end
+
+	if parent:IsA("Backpack") and parent.Parent and parent.Parent:IsA("Player") then
+		return parent.Parent
+	end
+
+	if parent:IsA("Model") then
+		return Players:GetPlayerFromCharacter(parent)
+	end
+
+	return nil
+end
+
+local function getLiveHumanoid(player)
+	if not player or deadPlayers[player] then
+		return nil
+	end
+
+	local character = player.Character
+	if not character then
+		return nil
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return nil
+	end
+
+	return humanoid
+end
+
+local function findHumanoidFromInstance(instance)
+	local current = instance
+	while current do
+		if current:IsA("Model") then
+			local humanoid = current:FindFirstChildOfClass("Humanoid")
+			if humanoid then
+				return humanoid
+			end
+		end
+
+		current = current.Parent
+	end
+
+	return nil
+end
+
+local function beginWeaponReload(player, tool, state)
+	if not player or not tool or not state then
+		return
+	end
+
+	if state.isReloading or state.ammo >= state.definition.clipSize then
+		return
+	end
+
+	state.isReloading = true
+	syncWeaponAttributes(tool, state)
+
+	task.delay(state.definition.reloadTime, function()
+		if weaponStates[tool] ~= state then
+			return
+		end
+
+		if getToolOwner(tool) ~= player then
+			return
+		end
+
+		state.isReloading = false
+		state.ammo = state.definition.clipSize
+		syncWeaponAttributes(tool, state)
+	end)
+end
+
+local function tagHumanoidKiller(humanoid, player)
+	local existingTag = humanoid:FindFirstChild("creator")
+	if existingTag then
+		existingTag:Destroy()
+	end
+
+	local creatorTag = Instance.new("ObjectValue")
+	creatorTag.Name = "creator"
+	creatorTag.Value = player
+	creatorTag.Parent = humanoid
+	Debris:AddItem(creatorTag, 2)
+end
+
+local function getBulletsFolder()
+	return Workspace:FindFirstChild("BulletsFolder")
+end
+
+local function createHitboxDebugMarker(position, color)
+	if not DEBUG_HITSCAN_MARKERS_ENABLED then
+		return
+	end
+
+	local marker = Instance.new("Part")
+	marker.Name = "HitboxTesterMarker"
+	marker.Shape = Enum.PartType.Ball
+	marker.Size = Vector3.new(0.22, 0.22, 0.22)
+	marker.Material = Enum.Material.Neon
+	marker.Color = color
+	marker.Transparency = 0.05
+	marker.Anchored = true
+	marker.CanCollide = false
+	marker.CanTouch = false
+	marker.CanQuery = false
+	marker.CFrame = CFrame.new(position)
+	marker.Parent = getBulletsFolder() or Workspace
+	Debris:AddItem(marker, 0.8)
+end
+
+local function resolveWeaponFireOrigin(character, clientOrigin)
+	local head = character and character:FindFirstChild("Head")
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	local fallback = (head and head.Position) or (rootPart and rootPart.Position)
+	if not fallback then
+		return nil
+	end
+
+	if typeof(clientOrigin) ~= "Vector3" then
+		return fallback
+	end
+
+	local headDistance = head and (clientOrigin - head.Position).Magnitude or math.huge
+	local rootDistance = rootPart and (clientOrigin - rootPart.Position).Magnitude or math.huge
+	if math.min(headDistance, rootDistance) <= MAX_CLIENT_FIRE_ORIGIN_DISTANCE then
+		return clientOrigin
+	end
+
+	return fallback
+end
+
+local function shouldIgnoreRaycastPassthroughPart(instance)
+	if not instance or instance:IsA("Terrain") or instance.Name == "Baseplate" then
+		return false
+	end
+
+	if findHumanoidFromInstance(instance) then
+		return false
+	end
+
+	if instance:FindFirstAncestorWhichIsA("Tool") then
+		return true
+	end
+
+	if instance.Name == "Bullet" or instance.Name == "Shell" or instance.Name == "HitboxTesterMarker" then
+		return true
+	end
+
+	if instance:IsA("BasePart") and instance.Transparency >= 0.95 then
+		return true
+	end
+
+	return false
+end
+
+local function raycastWeapon(definition, character, origin, direction)
+	local bulletsFolder = getBulletsFolder()
+	local filterInstances = { character }
+	if bulletsFolder then
+		table.insert(filterInstances, bulletsFolder)
+	end
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.IgnoreWater = true
+
+	local unitDirection = direction.Unit
+	local maxPasses = 8
+	local currentOrigin = origin
+	local remainingRange = definition.range
+	local lastResult = nil
+
+	for _ = 1, maxPasses do
+		rayParams.FilterDescendantsInstances = filterInstances
+
+		local result = Workspace:Raycast(currentOrigin, unitDirection * remainingRange, rayParams)
+		if not result then
+			return nil
+		end
+
+		lastResult = result
+		if not shouldIgnoreRaycastPassthroughPart(result.Instance) then
+			return result
+		end
+
+		table.insert(filterInstances, result.Instance)
+		local traveled = (result.Position - origin).Magnitude
+		remainingRange = definition.range - traveled
+		if remainingRange <= 0.05 then
+			break
+		end
+
+		currentOrigin = result.Position + unitDirection * 0.05
+	end
+
+	return lastResult
+end
+
+local function handleWeaponFire(player, tool, clientOrigin, direction)
+	if not roundActive then
+		return
+	end
+
+	if typeof(clientOrigin) == "Vector3" and typeof(direction) ~= "Vector3" then
+		direction = clientOrigin
+		clientOrigin = nil
+	end
+
+	if typeof(direction) ~= "Vector3" or direction.Magnitude <= 0.001 then
+		return
+	end
+
+	if not tool or not tool:IsA("Tool") or tool.Parent ~= player.Character then
+		return
+	end
+
+	local state = weaponStates[tool]
+	if not state or getToolOwner(tool) ~= player then
+		return
+	end
+
+	local humanoid = getLiveHumanoid(player)
+	if not humanoid or state.isReloading then
+		return
+	end
+
+	local now = os.clock()
+	if now - state.lastFireAt < state.definition.fireCooldown then
+		return
+	end
+
+	if state.ammo <= 0 then
+		return
+	end
+
+	local character = player.Character
+	local origin = resolveWeaponFireOrigin(character, clientOrigin)
+	if not origin then
+		return
+	end
+
+	state.lastFireAt = now
+	state.ammo -= 1
+	syncWeaponAttributes(tool, state)
+
+	local result = raycastWeapon(state.definition, character, origin, direction)
+	if not result then
+		if state.definition.weaponId == "hitbox_tester" then
+			createHitboxDebugMarker(origin + direction.Unit * math.min(state.definition.range, 80), Color3.fromRGB(255, 80, 80))
+		end
+		return
+	end
+
+	local targetHumanoid = findHumanoidFromInstance(result.Instance)
+	if not targetHumanoid or targetHumanoid == humanoid or targetHumanoid.Health <= 0 then
+		if state.definition.weaponId == "hitbox_tester" then
+			createHitboxDebugMarker(result.Position, Color3.fromRGB(255, 175, 35))
+		end
+		return
+	end
+
+	local targetCharacter = targetHumanoid.Parent
+	if targetCharacter == character then
+		if state.definition.weaponId == "hitbox_tester" then
+			createHitboxDebugMarker(result.Position, Color3.fromRGB(255, 80, 80))
+		end
+		return
+	end
+
+	tagHumanoidKiller(targetHumanoid, player)
+	targetHumanoid:TakeDamage(state.definition.damage)
+	if state.definition.weaponId == "hitbox_tester" then
+		createHitboxDebugMarker(result.Position, Color3.fromRGB(70, 255, 120))
+	end
+end
+
+ensureHealthRegenOverrideScript()
+ensureWeaponPrototypes()
+
+local function clearGrantedTools(player)
+	local containers = {
+		player:FindFirstChild("Backpack"),
+		player.Character,
+	}
+
+	for _, container in containers do
+		if container then
+			for _, child in container:GetChildren() do
+				if child:IsA("Tool") and child:GetAttribute("BrainrotGranted") then
+					child:Destroy()
+				end
+			end
+		end
+	end
+end
+
+local function clearStandaloneTools(player)
+	local containers = {
+		player:FindFirstChild("Backpack"),
+		player.Character,
+	}
+
+	for _, container in containers do
+		if container then
+			for _, child in container:GetChildren() do
+				if child:IsA("Tool") and child:GetAttribute("TTTUseWeaponController") == true then
+					child:Destroy()
+				end
+			end
+		end
+	end
+end
+
+local function giveToolIfExists(player, toolName)
+	local tool = ServerStorage:FindFirstChild(toolName, true)
+	if not tool or not tool:IsA("Tool") then
+		return
+	end
+
+	local backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack", 2)
+	if not backpack then
+		return
+	end
+
+	local clone = tool:Clone()
+	clone:SetAttribute("BrainrotGranted", true)
+	initializeWeaponInstance(clone)
+	clone.Parent = backpack
+
+	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if humanoid and clone:GetAttribute("TTTWeaponId") ~= nil then
+		humanoid:EquipTool(clone)
+	end
+end
+
+local function clearBrainrotVisuals(character)
+	disconnectVisualAnimation(character)
+	clearBrainrotHitboxes(character)
+
+	for _, child in character:GetChildren() do
+		if child:GetAttribute("BrainrotApplied") then
+			child:Destroy()
+		end
+	end
+
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant.Name ~= "HumanoidRootPart" then
+			local originalTransparency = descendant:GetAttribute("BrainrotOriginalTransparency")
+			local originalCanQuery = descendant:GetAttribute("BrainrotOriginalCanQuery")
+			if originalTransparency ~= nil then
+				descendant.Transparency = originalTransparency
+				descendant:SetAttribute("BrainrotOriginalTransparency", nil)
+			end
+			if originalCanQuery ~= nil then
+				descendant.CanQuery = originalCanQuery
+				descendant:SetAttribute("BrainrotOriginalCanQuery", nil)
+			end
+		elseif descendant:IsA("Decal") then
+			local originalTransparency = descendant:GetAttribute("BrainrotOriginalTransparency")
+			if originalTransparency ~= nil then
+				descendant.Transparency = originalTransparency
+				descendant:SetAttribute("BrainrotOriginalTransparency", nil)
+			end
+		end
+	end
+end
+
+local function getFlatDirection(vector, fallback)
+	local flattened = Vector3.new(vector.X, 0, vector.Z)
+	if flattened.Magnitude > 0.001 then
+		return flattened.Unit
+	end
+
+	local fallbackDirection = fallback or Vector3.new(0, 0, -1)
+	local fallbackFlat = Vector3.new(fallbackDirection.X, 0, fallbackDirection.Z)
+	if fallbackFlat.Magnitude > 0.001 then
+		return fallbackFlat.Unit
+	end
+
+	return Vector3.new(0, 0, -1)
+end
+
+local function setCharacterAnchored(character, anchored)
+	if character:IsA("BasePart") then
+		character.Anchored = anchored
+		character.CanCollide = false
+		character.CanTouch = false
+
+		if anchored then
+			character.AssemblyLinearVelocity = Vector3.zero
+			character.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
+
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.Anchored = anchored
+			descendant.CanCollide = false
+			descendant.CanTouch = false
+
+			if anchored then
+				descendant.AssemblyLinearVelocity = Vector3.zero
+				descendant.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+	end
+end
+
+local function markInstanceAsCorpse(corpseInstance, player)
+	local brainrotId = getEffectiveBrainrotId(player)
+	local brainrotConfig = brainrotId and BRAINROTS[brainrotId] or nil
+	local corpseRole = playerRoles[player] or "Unknown"
+	local corpseTeam = if corpseRole == "Traitor" then "Traitor" else "Innocent"
+
+	corpseInstance:SetAttribute("TTTCorpse", true)
+	corpseInstance:SetAttribute("CorpsePlayerName", player.Name)
+	corpseInstance:SetAttribute("CorpseUserId", player.UserId)
+	corpseInstance:SetAttribute("CorpseRole", corpseRole)
+	corpseInstance:SetAttribute("CorpseTeam", corpseTeam)
+	corpseInstance:SetAttribute("CorpseBrainrotId", brainrotId or "")
+	corpseInstance:SetAttribute("CorpseBrainrotName", brainrotConfig and brainrotConfig.displayName or "")
+	corpseInstance:SetAttribute("CorpseCreatedAt", os.time())
+	corpseInstance:SetAttribute("CorpseIdentified", false)
+end
+
+local function cloneCorpseAsset(asset)
+	local corpseClone
+
+	if asset:IsA("Model") then
+		corpseClone = asset:Clone()
+	elseif asset:IsA("Folder") then
+		corpseClone = Instance.new("Model")
+		corpseClone.Name = asset.Name
+
+		for _, child in asset:GetChildren() do
+			child:Clone().Parent = corpseClone
+		end
+	else
+		corpseClone = asset:Clone()
+	end
+
+	for _, descendant in corpseClone:GetDescendants() do
+		if descendant:IsA("Script") or descendant:IsA("LocalScript") or descendant:IsA("ModuleScript") then
+			descendant:Destroy()
+		end
+	end
+
+	return corpseClone
+end
+
+local function getCorpsePrimaryPart(corpseInstance)
+	if corpseInstance:IsA("BasePart") then
+		return corpseInstance
+	end
+
+	if corpseInstance:IsA("Model") then
+		if corpseInstance.PrimaryPart then
+			return corpseInstance.PrimaryPart
+		end
+
+		local primaryPart = corpseInstance:FindFirstChildWhichIsA("BasePart", true)
+		if primaryPart then
+			corpseInstance.PrimaryPart = primaryPart
+		end
+
+		return primaryPart
+	end
+
+	return corpseInstance:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getInstanceBoundingSize(instance)
+	if instance:IsA("BasePart") then
+		return instance.Size
+	end
+
+	local _, boxSize = instance:GetBoundingBox()
+	return boxSize
+end
+
+local function getCorpseTargetCFrame(corpseInstance, originCFrame, raycastIgnoreList, layAngle)
+	local rootPosition = originCFrame.Position
+	local facingDirection = getFlatDirection(originCFrame.LookVector)
+	local boxSize = getInstanceBoundingSize(corpseInstance)
+	local corpseThickness = math.max(math.min(boxSize.X, boxSize.Z), 0.8)
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = raycastIgnoreList or { corpseInstance }
+
+	local groundResult = Workspace:Raycast(rootPosition + Vector3.new(0, 8, 0), Vector3.new(0, -40, 0), raycastParams)
+	local targetY
+
+	if groundResult then
+		targetY = groundResult.Position.Y + (corpseThickness * 0.5) + CORPSE_GROUND_CLEARANCE
+	else
+		targetY = rootPosition.Y - math.clamp(boxSize.Y * 0.35, 1.5, 4)
+	end
+
+	local targetPosition = Vector3.new(rootPosition.X, targetY, rootPosition.Z) + (facingDirection * 0.35)
+	return CFrame.lookAt(targetPosition, targetPosition + facingDirection) * CFrame.Angles(0, 0, layAngle or 0)
+end
+
+local function animateCorpseFall(corpseInstance, startCFrame, targetCFrame)
+	task.spawn(function()
+		local startTime = time()
+
+		while corpseInstance.Parent do
+			local alpha = math.clamp((time() - startTime) / CORPSE_FALL_DURATION, 0, 1)
+			local easedAlpha = 1 - ((1 - alpha) * (1 - alpha) * (1 - alpha))
+
+			corpseInstance:PivotTo(startCFrame:Lerp(targetCFrame, easedAlpha))
+
+			if alpha >= 1 then
+				break
+			end
+
+			RunService.Heartbeat:Wait()
+		end
+
+		if corpseInstance.Parent then
+			corpseInstance:PivotTo(targetCFrame)
+		end
+	end)
+end
+
+local function cleanupSpawnedCorpses()
+	for _, corpseInstance in ipairs(spawnedCorpses) do
+		if corpseInstance and corpseInstance.Parent then
+			corpseInstance:Destroy()
+		end
+	end
+
+	spawnedCorpses = {}
+end
+
+local function getCorpseDisplayName(corpseInstance)
+	return corpseInstance:GetAttribute("CorpsePlayerName")
+end
+
+local function getCorpseAlignmentLabel(corpseInstance)
+	local corpseTeam = corpseInstance:GetAttribute("CorpseTeam")
+	if corpseTeam == "Traitor" then
+		return "Traitor"
+	end
+
+	return "Innocent"
+end
+
+local function getAlignmentTranslationKey(alignment)
+	if alignment == "Traitor" then
+		return "role.alignment.traitor"
+	end
+
+	return "role.alignment.innocent"
+end
+
+local function attachCorpseIdentifyPrompt(corpseInstance)
+	local promptParent = getCorpsePrimaryPart(corpseInstance)
+	if not promptParent then
+		return
+	end
+
+	local existingPrompt = promptParent:FindFirstChild("CorpseIdentifyPrompt")
+	if existingPrompt and existingPrompt:IsA("ProximityPrompt") then
+		return
+	end
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "CorpseIdentifyPrompt"
+	prompt.ActionText = t("en", "corpse.promptAction")
+	prompt.ObjectText = t("en", "corpse.promptObject")
+	prompt.KeyboardKeyCode = CORPSE_IDENTIFY_KEY
+	prompt.MaxActivationDistance = CORPSE_IDENTIFY_DISTANCE
+	prompt.HoldDuration = CORPSE_IDENTIFY_HOLD_DURATION
+	prompt.RequiresLineOfSight = false
+	prompt.Style = Enum.ProximityPromptStyle.Default
+	prompt.Parent = promptParent
+
+	prompt.Triggered:Connect(function(triggeringPlayer)
+		if not roundActive then
+			return
+		end
+
+		if playerRoles[triggeringPlayer] ~= "Detective" then
+			return
+		end
+
+		if corpseInstance:GetAttribute("CorpseIdentified") then
+			return
+		end
+
+		corpseInstance:SetAttribute("CorpseIdentified", true)
+		prompt.Enabled = false
+
+		local identifiedPlayerName = getCorpseDisplayName(corpseInstance)
+		local identifiedAlignment = getCorpseAlignmentLabel(corpseInstance)
+		broadcastLocalized("corpseIdentified", {
+			playerName = identifiedPlayerName,
+			alignment = identifiedAlignment,
+			role = corpseInstance:GetAttribute("CorpseRole") or identifiedAlignment,
+			identifiedBy = triggeringPlayer.Name,
+		}, "corpse.identified", function(player)
+			return {
+				playerName = identifiedPlayerName or t(player, "common.unknown"),
+				alignment = t(player, getAlignmentTranslationKey(identifiedAlignment)),
+			}
+		end)
+
+		task.delay(CORPSE_IDENTIFIED_DESPAWN_DELAY, function()
+			if corpseInstance and corpseInstance.Parent then
+				corpseInstance:Destroy()
+			end
+		end)
+	end)
+end
+
+local function spawnSharedCorpse(player, character, startCFrame)
+	local corpseAsset = corpseAssetsFolder:FindFirstChild(SHARED_CORPSE_ASSET_NAME)
+	if not corpseAsset then
+		return nil
+	end
+
+	local corpseClone = cloneCorpseAsset(corpseAsset)
+	local corpsePrimaryPart = getCorpsePrimaryPart(corpseClone)
+	if not corpsePrimaryPart then
+		corpseClone:Destroy()
+		return nil
+	end
+
+	corpseClone.Name = "Corpse_" .. player.Name
+	corpseClone.Parent = Workspace
+	corpseClone:PivotTo(startCFrame)
+
+	setCharacterAnchored(corpseClone, true)
+	markInstanceAsCorpse(corpseClone, player)
+	attachCorpseIdentifyPrompt(corpseClone)
+	table.insert(spawnedCorpses, corpseClone)
+
+	local targetCFrame = getCorpseTargetCFrame(corpseClone, startCFrame, { character, corpseClone }, 0)
+	animateCorpseFall(corpseClone, startCFrame, targetCFrame)
+
+	return corpseClone
+end
+
+local function preserveCorpse(player, character)
+	if not character or character.Parent == nil then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not rootPart then
+		return
+	end
+
+	disconnectVisualAnimation(character)
+	clearGrantedTools(player)
+	clearBrainrotHitboxes(character)
+
+	humanoid.AutoRotate = false
+	if humanoid.RootPart then
+		humanoid.RootPart.AssemblyLinearVelocity = Vector3.zero
+		humanoid.RootPart.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	local startCFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + getFlatDirection(rootPart.CFrame.LookVector))
+	local sharedCorpse = spawnSharedCorpse(player, character, startCFrame)
+	if sharedCorpse then
+		task.defer(function()
+			if character.Parent then
+				character:Destroy()
+			end
+		end)
+		return
+	end
+
+	markInstanceAsCorpse(character, player)
+	character.PrimaryPart = rootPart
+	attachCorpseIdentifyPrompt(character)
+	local targetCFrame = getCorpseTargetCFrame(character, startCFrame, { character }, CORPSE_FALL_ANGLE)
+
+	setCharacterAnchored(character, true)
+	character:PivotTo(startCFrame)
+	animateCorpseFall(character, startCFrame, targetCFrame)
+end
+
+local function isBrainrotAppliedInstance(instance)
+	local current = instance
+
+	while current do
+		if current:GetAttribute("BrainrotApplied") then
+			return true
+		end
+
+		current = current.Parent
+	end
+
+	return false
+end
+
+local function hideBaseCharacter(character, shouldHide)
+	for _, descendant in character:GetDescendants() do
+		if isBrainrotAppliedInstance(descendant) then
+			continue
+		end
+
+		if descendant:IsA("BasePart") and descendant.Name ~= "HumanoidRootPart" then
+			if shouldHide then
+				if descendant:GetAttribute("BrainrotOriginalTransparency") == nil then
+					descendant:SetAttribute("BrainrotOriginalTransparency", descendant.Transparency)
+				end
+				if descendant:GetAttribute("BrainrotOriginalCanQuery") == nil then
+					descendant:SetAttribute("BrainrotOriginalCanQuery", descendant.CanQuery)
+				end
+				descendant.Transparency = 1
+				descendant.CanQuery = false
+			else
+				local originalTransparency = descendant:GetAttribute("BrainrotOriginalTransparency")
+				local originalCanQuery = descendant:GetAttribute("BrainrotOriginalCanQuery")
+				if originalTransparency ~= nil then
+					descendant.Transparency = originalTransparency
+					descendant:SetAttribute("BrainrotOriginalTransparency", nil)
+				end
+				if originalCanQuery ~= nil then
+					descendant.CanQuery = originalCanQuery
+					descendant:SetAttribute("BrainrotOriginalCanQuery", nil)
+				end
+			end
+		elseif descendant:IsA("Decal") then
+			if shouldHide then
+				if descendant:GetAttribute("BrainrotOriginalTransparency") == nil then
+					descendant:SetAttribute("BrainrotOriginalTransparency", descendant.Transparency)
+				end
+				descendant.Transparency = 1
+			else
+				local originalTransparency = descendant:GetAttribute("BrainrotOriginalTransparency")
+				if originalTransparency ~= nil then
+					descendant.Transparency = originalTransparency
+					descendant:SetAttribute("BrainrotOriginalTransparency", nil)
+				end
+			end
+		end
+	end
+end
+
+clearBrainrotHitboxes = function(character)
+	return
+end
+
+local function configureBrainrotQueryPart(part)
+	if not part or not part:IsA("BasePart") then
+		return
+	end
+
+	if part.Name:match("^HB_") ~= nil and part:FindFirstAncestor("Hitboxes") ~= nil then
+		part.Transparency = 1
+		part.CanQuery = false
+		part.CanTouch = false
+		part.CanCollide = false
+		return
+	end
+
+	part:SetAttribute("BrainrotHitbox", nil)
+	local shouldQueryPart = part.Name ~= "BrainrotVisualRoot" and part.Transparency < 0.99
+	part.CanQuery = shouldQueryPart
+
+	if shouldQueryPart and part:IsA("MeshPart") then
+		pcall(function()
+			part.CollisionFidelity = Enum.CollisionFidelity.PreciseConvexDecomposition
+		end)
+	end
+end
+
+local function createBrainrotHitboxes(character, brainrotId)
+	clearBrainrotHitboxes(character)
+
+	for _, descendant in character:GetDescendants() do
+		if not descendant:IsA("BasePart") then
+			continue
+		end
+
+		if isBrainrotAppliedInstance(descendant) then
+			configureBrainrotQueryPart(descendant)
+		end
+	end
+end
+
+local function collectWearables(asset)
+	local wearables = {}
+
+	local function collectWearable(instance)
+		if instance:IsA("Accessory")
+			or instance:IsA("Shirt")
+			or instance:IsA("Pants")
+			or instance:IsA("BodyColors")
+			or instance:IsA("ShirtGraphic")
+			or instance:IsA("CharacterMesh")
+		then
+			table.insert(wearables, instance)
+		end
+	end
+
+	collectWearable(asset)
+
+	for _, descendant in asset:GetDescendants() do
+		collectWearable(descendant)
+	end
+
+	return wearables
+end
+
+local function applyWearablesToModel(character, asset, markAsApplied)
+	local wearablesFound = false
+	local wearablesToClone = collectWearables(asset)
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+	for _, wearable in wearablesToClone do
+		if wearable:IsA("Shirt") then
+			for _, child in character:GetChildren() do
+				if child:IsA("Shirt") then
+					child:Destroy()
+				end
+			end
+		elseif wearable:IsA("Pants") then
+			for _, child in character:GetChildren() do
+				if child:IsA("Pants") then
+					child:Destroy()
+				end
+			end
+		elseif wearable:IsA("BodyColors") then
+			for _, child in character:GetChildren() do
+				if child:IsA("BodyColors") then
+					child:Destroy()
+				end
+			end
+		end
+
+		local clone = wearable:Clone()
+		if markAsApplied then
+			clone:SetAttribute("BrainrotApplied", true)
+		end
+
+		if clone:IsA("Accessory") and humanoid then
+			local success = pcall(function()
+				humanoid:AddAccessory(clone)
+			end)
+
+			if not success then
+				clone.Parent = character
+			end
+		else
+			clone.Parent = character
+		end
+
+		for _, descendant in clone:GetDescendants() do
+			if descendant:IsA("BasePart") then
+				configureBrainrotQueryPart(descendant)
+			end
+		end
+
+		wearablesFound = true
+	end
+
+	return wearablesFound
+end
+
+local function cloneWearables(character, asset)
+	return applyWearablesToModel(character, asset, true)
+end
+
+local function stripScripts(container)
+	for _, descendant in container:GetDescendants() do
+		if descendant:IsA("Script") or descendant:IsA("LocalScript") or descendant:IsA("ModuleScript") then
+			descendant:Destroy()
+		end
+	end
+end
+
+local function buildVisualModel(asset)
+	local visualModel
+
+	if asset:IsA("Model") then
+		visualModel = asset:Clone()
+	elseif asset:IsA("Folder") then
+		visualModel = Instance.new("Model")
+		visualModel.Name = asset.Name
+
+		for _, child in asset:GetChildren() do
+			child:Clone().Parent = visualModel
+		end
+	else
+		visualModel = Instance.new("Model")
+		visualModel.Name = asset.Name
+		asset:Clone().Parent = visualModel
+	end
+
+	stripScripts(visualModel)
+	visualModel:SetAttribute("BrainrotApplied", true)
+	return visualModel
+end
+
+local function scaleModelIfNeeded(model, scale)
+	if not scale or scale == 1 then
+		return
+	end
+
+	pcall(function()
+		model:ScaleTo(scale)
+	end)
+end
+
+local function getLargestBoundingAxis(model)
+	local _, boxSize = model:GetBoundingBox()
+	return math.max(boxSize.X, boxSize.Y, boxSize.Z, 0.001)
+end
+
+local function resolveAssetScale(asset, config)
+	if not config then
+		return nil
+	end
+
+	if config.assetScale then
+		return config.assetScale
+	end
+
+	if not config.matchVisualScaleOf then
+		return nil
+	end
+
+	local cacheKey = config.assetName
+	if cacheKey and resolvedAssetScales[cacheKey] then
+		return resolvedAssetScales[cacheKey]
+	end
+
+	local referenceConfig = BRAINROTS[config.matchVisualScaleOf]
+	if not referenceConfig then
+		return nil
+	end
+
+	local referenceAsset = brainrotAssetsFolder:FindFirstChild(referenceConfig.assetName)
+	if not referenceAsset then
+		return nil
+	end
+
+	local sourceModel = buildVisualModel(asset)
+	local referenceModel = buildVisualModel(referenceAsset)
+	local sourceLargestAxis = getLargestBoundingAxis(sourceModel)
+	local referenceLargestAxis = getLargestBoundingAxis(referenceModel)
+	sourceModel:Destroy()
+	referenceModel:Destroy()
+
+	if sourceLargestAxis <= 0 or referenceLargestAxis <= 0 then
+		return nil
+	end
+
+	local referenceScale = referenceConfig.assetScale or 1
+	local resolvedScale = (referenceLargestAxis * referenceScale) / sourceLargestAxis
+
+	if cacheKey then
+		resolvedAssetScales[cacheKey] = resolvedScale
+	end
+
+	return resolvedScale
+end
+
+local function applyConfiguredPartOffsets(container, partOffsets)
+	if not partOffsets then
+		return
+	end
+
+	for _, descendant in container:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			local offset = partOffsets[descendant.Name]
+			if offset then
+				descendant.Position = descendant.Position + offset
+			end
+		end
+	end
+end
+
+local function createVisualMotionRoot(character, rootPart, baseOffset)
+	local motionRoot = Instance.new("Part")
+	motionRoot.Name = "BrainrotVisualRoot"
+	motionRoot.Size = Vector3.new(1, 1, 1)
+	motionRoot.Transparency = 1
+	motionRoot.CanCollide = false
+	motionRoot.CanTouch = false
+	motionRoot.CanQuery = false
+	motionRoot.Massless = true
+	motionRoot.CastShadow = false
+	motionRoot.Anchored = false
+	motionRoot.CFrame = rootPart.CFrame * baseOffset
+	motionRoot:SetAttribute("BrainrotApplied", true)
+	motionRoot.Parent = character
+
+	local weld = Instance.new("Weld")
+	weld.Name = "BrainrotVisualMotionWeld"
+	weld.Part0 = rootPart
+	weld.Part1 = motionRoot
+	weld.C0 = baseOffset
+	weld.Parent = motionRoot
+
+	return motionRoot, weld
+end
+
+local function startVisualMotion(character, rootPart, motionWeld, config)
+	if not config or config.visualMotionStyle ~= "GoofyWalk" then
+		return
+	end
+
+	disconnectVisualAnimation(character)
+
+	local baseOffset = config.assetOffset or CFrame.new()
+	local startTime = time()
+
+	visualAnimationConnections[character] = RunService.Heartbeat:Connect(function()
+		if character.Parent == nil or rootPart.Parent == nil or motionWeld.Parent == nil then
+			disconnectVisualAnimation(character)
+			return
+		end
+
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if not humanoid then
+			return
+		end
+
+		local elapsed = time() - startTime
+		local horizontalVelocity = Vector3.new(rootPart.AssemblyLinearVelocity.X, 0, rootPart.AssemblyLinearVelocity.Z).Magnitude
+		local moveBlend = math.clamp(horizontalVelocity / math.max(humanoid.WalkSpeed, 1), 0, 1.35)
+		local isMoving = humanoid.MoveDirection.Magnitude > 0.05 and moveBlend > 0.08
+		local animationOffset
+
+		if isMoving then
+			local walkSpeed = 8 + (moveBlend * 8)
+			local stepWave = math.sin(elapsed * walkSpeed)
+			local swayWave = math.sin(elapsed * (walkSpeed * 0.5))
+			local bounce = math.abs(stepWave) * (0.22 + moveBlend * 0.08)
+			local sideShift = swayWave * (0.12 + moveBlend * 0.04)
+			local pitch = math.rad(-6) * math.abs(stepWave)
+			local yaw = math.rad(4) * swayWave
+			local roll = math.rad(10) * stepWave
+
+			animationOffset = CFrame.new(sideShift, bounce, 0) * CFrame.Angles(pitch, yaw, roll)
+		else
+			local idleWave = math.sin(elapsed * 2.4)
+			local bob = idleWave * 0.06
+			local roll = math.rad(2) * idleWave
+
+			animationOffset = CFrame.new(0, bob, 0) * CFrame.Angles(0, 0, roll)
+		end
+
+		motionWeld.C0 = baseOffset * animationOffset
+	end)
+end
+
+local function collectCharacterWeldTargets(character)
+	local targets = {}
+
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") and not isBrainrotAppliedInstance(descendant) then
+			table.insert(targets, descendant)
+		end
+	end
+
+	return targets
+end
+
+local function findClosestWeldTarget(part, targets, fallback)
+	local closestTarget = fallback
+	local closestDistance = math.huge
+
+	for _, target in ipairs(targets) do
+		local distance = (target.Position - part.Position).Magnitude
+		if distance < closestDistance then
+			closestDistance = distance
+			closestTarget = target
+		end
+	end
+
+	return closestTarget or fallback
+end
+
+local function findCharacterPartByNames(character, names)
+	for _, name in ipairs(names) do
+		local part = character:FindFirstChild(name, true)
+		if part and part:IsA("BasePart") then
+			return part
+		end
+	end
+
+	return nil
+end
+
+local function findNamedVisualAnchor(instance, visualModel)
+	local current = instance
+
+	while current and current ~= visualModel do
+		local lowerName = string.lower(current.Name)
+		if lowerName == "leftshoe" or lowerName == "rightshoe" or lowerName == "middleshoe" or lowerName == "body" then
+			return lowerName
+		end
+
+		current = current.Parent
+	end
+
+	return nil
+end
+
+local function resolveRigidVisualTarget(character, fallback, config)
+	local preferredTargetNames = config and config.rigidVisualTargetNames
+	if preferredTargetNames then
+		local preferredTarget = findCharacterPartByNames(character, preferredTargetNames)
+		if preferredTarget then
+			return preferredTarget
+		end
+	end
+
+	return findCharacterPartByNames(character, { "UpperTorso", "Torso", "LowerTorso", "HumanoidRootPart" }) or fallback
+end
+
+local function findPreferredWeldTarget(character, part, visualModel, closestTargets, fallback, config)
+	local anchorName = findNamedVisualAnchor(part, visualModel)
+	local rigidTarget = resolveRigidVisualTarget(character, fallback, config)
+
+	if config and config.rigidVisual then
+		return rigidTarget
+	end
+
+	if anchorName == "leftshoe" then
+		return findCharacterPartByNames(character, { "LeftFoot", "LeftLowerLeg", "LeftUpperLeg", "Left Leg" }) or fallback
+	end
+
+	if anchorName == "rightshoe" then
+		return findCharacterPartByNames(character, { "RightFoot", "RightLowerLeg", "RightUpperLeg", "Right Leg" }) or fallback
+	end
+
+	if anchorName == "middleshoe" then
+		return findCharacterPartByNames(character, { "LowerTorso", "UpperTorso", "Torso", "HumanoidRootPart" }) or fallback
+	end
+
+	if anchorName == "body" then
+		return findCharacterPartByNames(character, { "UpperTorso", "Torso", "LowerTorso", "HumanoidRootPart" }) or fallback
+	end
+
+	return findClosestWeldTarget(part, closestTargets, fallback)
+end
+
+local function hasNonAccessoryGeometry(asset)
+	if asset:IsA("BasePart") and not asset:FindFirstAncestorWhichIsA("Accessory") then
+		return true
+	end
+
+	for _, descendant in asset:GetDescendants() do
+		if descendant:IsA("BasePart") and not descendant:FindFirstAncestorWhichIsA("Accessory") then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function createPreviewBodyPart(parent, name, size, cframe)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	part.CFrame = cframe
+	part.Color = Color3.fromRGB(255, 220, 195)
+	part.Material = Enum.Material.SmoothPlastic
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.CanCollide = false
+	part.Anchored = true
+	part.Parent = parent
+	return part
+end
+
+local function addPreviewAttachment(parent, name, position)
+	local attachment = Instance.new("Attachment")
+	attachment.Name = name
+	attachment.Position = position
+	attachment.Parent = parent
+	return attachment
+end
+
+local function createPreviewRig(name)
+	local model = Instance.new("Model")
+	model.Name = name
+
+	local humanoid = Instance.new("Humanoid")
+	humanoid.Name = "Humanoid"
+	humanoid.RigType = Enum.HumanoidRigType.R6
+	humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+	humanoid.Parent = model
+
+	local rootPart = createPreviewBodyPart(model, "HumanoidRootPart", Vector3.new(2, 2, 1), CFrame.new(0, 3, 0))
+	rootPart.Transparency = 1
+
+	local torso = createPreviewBodyPart(model, "Torso", Vector3.new(2, 2, 1), CFrame.new(0, 3, 0))
+	local head = createPreviewBodyPart(model, "Head", Vector3.new(2, 1, 1), CFrame.new(0, 4.5, 0))
+	local leftArm = createPreviewBodyPart(model, "Left Arm", Vector3.new(1, 2, 1), CFrame.new(-1.5, 3, 0))
+	local rightArm = createPreviewBodyPart(model, "Right Arm", Vector3.new(1, 2, 1), CFrame.new(1.5, 3, 0))
+	local leftLeg = createPreviewBodyPart(model, "Left Leg", Vector3.new(1, 2, 1), CFrame.new(-0.5, 1, 0))
+	local rightLeg = createPreviewBodyPart(model, "Right Leg", Vector3.new(1, 2, 1), CFrame.new(0.5, 1, 0))
+
+	addPreviewAttachment(head, "HatAttachment", Vector3.new(0, 0.5, 0))
+	addPreviewAttachment(head, "HairAttachment", Vector3.new(0, 0.5, 0))
+	addPreviewAttachment(head, "FaceFrontAttachment", Vector3.new(0, 0, -0.6))
+	addPreviewAttachment(head, "FaceCenterAttachment", Vector3.new(0, 0, -0.6))
+	addPreviewAttachment(torso, "BodyFrontAttachment", Vector3.new(0, 0, -0.5))
+	addPreviewAttachment(torso, "BodyBackAttachment", Vector3.new(0, 0, 0.5))
+	addPreviewAttachment(torso, "NeckAttachment", Vector3.new(0, 1, 0))
+	addPreviewAttachment(torso, "WaistFrontAttachment", Vector3.new(0, -1, -0.5))
+	addPreviewAttachment(torso, "WaistBackAttachment", Vector3.new(0, -1, 0.5))
+	addPreviewAttachment(leftArm, "LeftShoulderAttachment", Vector3.new(0, 1, 0))
+	addPreviewAttachment(rightArm, "RightShoulderAttachment", Vector3.new(0, 1, 0))
+	addPreviewAttachment(leftLeg, "LeftFootAttachment", Vector3.new(0, -1, 0))
+	addPreviewAttachment(rightLeg, "RightFootAttachment", Vector3.new(0, -1, 0))
+
+	local face = Instance.new("Decal")
+	face.Name = "face"
+	face.Texture = "rbxasset://textures/face.png"
+	face.Parent = head
+
+	model.PrimaryPart = rootPart
+	return model
+end
+
+local function buildPreviewAsset(asset, previewName, config)
+	if hasNonAccessoryGeometry(asset) then
+		local previewClone = buildVisualModel(asset)
+		previewClone.Name = previewName
+		scaleModelIfNeeded(previewClone, resolveAssetScale(asset, config))
+		if config and config.assetOffset then
+			pcall(function()
+				previewClone:PivotTo(config.assetOffset.Rotation)
+			end)
+		end
+		applyConfiguredPartOffsets(previewClone, config and config.partOffsets or nil)
+		return previewClone
+	end
+
+	local previewRig = createPreviewRig(previewName)
+	local wearablesFound = applyWearablesToModel(previewRig, asset, false)
+	stripScripts(previewRig)
+	scaleModelIfNeeded(previewRig, resolveAssetScale(asset, config))
+
+	if wearablesFound then
+		return previewRig
+	end
+
+	return nil
+end
+
+local function syncPreviewAssets()
+	for _, child in brainrotPreviewFolder:GetChildren() do
+		child:Destroy()
+	end
+
+	for brainrotId, config in BRAINROTS do
+		local asset = brainrotAssetsFolder:FindFirstChild(config.assetName)
+		if asset then
+			local previewClone = buildPreviewAsset(asset, brainrotId, config)
+			if previewClone then
+				previewClone.Parent = brainrotPreviewFolder
+			end
+		end
+	end
+end
+
+local function queuePreviewSync()
+	if previewSyncQueued then
+		return
+	end
+
+	previewSyncQueued = true
+	task.defer(function()
+		previewSyncQueued = false
+		resolvedAssetScales = {}
+		syncPreviewAssets()
+	end)
+end
+
+local function applyVisualModel(character, asset, config)
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return
+	end
+
+	local weldTargets = collectCharacterWeldTargets(character)
+	local visualModel = buildVisualModel(asset)
+	visualModel.Name = "BrainrotVisuals"
+	scaleModelIfNeeded(visualModel, resolveAssetScale(asset, config))
+
+	if not visualModel.PrimaryPart then
+		local primaryPart = visualModel:FindFirstChildWhichIsA("BasePart", true)
+		if primaryPart then
+			visualModel.PrimaryPart = primaryPart
+		end
+	end
+
+	if visualModel.PrimaryPart then
+		visualModel:PivotTo(rootPart.CFrame * (config.assetOffset or CFrame.new()))
+	end
+
+	applyConfiguredPartOffsets(visualModel, config.partOffsets)
+
+	visualModel.Parent = character
+
+	for _, descendant in visualModel:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.CanCollide = false
+			descendant.CanTouch = false
+			configureBrainrotQueryPart(descendant)
+			descendant.Massless = true
+			descendant.Anchored = false
+			descendant.CastShadow = false
+
+			local weldTarget = findPreferredWeldTarget(character, descendant, visualModel, weldTargets, rootPart, config)
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = weldTarget
+			weld.Part1 = descendant
+			weld.Parent = descendant
+		end
+	end
+
+	hideBaseCharacter(character, true)
+end
+
+local function applyAnimatedVisualModel(character, asset, config)
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return
+	end
+
+	local baseOffset = config.assetOffset or CFrame.new()
+	local motionRoot, motionWeld = createVisualMotionRoot(character, rootPart, baseOffset)
+	local visualModel = buildVisualModel(asset)
+	visualModel.Name = "BrainrotVisuals"
+	scaleModelIfNeeded(visualModel, resolveAssetScale(asset, config))
+
+	if not visualModel.PrimaryPart then
+		local primaryPart = visualModel:FindFirstChildWhichIsA("BasePart", true)
+		if primaryPart then
+			visualModel.PrimaryPart = primaryPart
+		end
+	end
+
+	if visualModel.PrimaryPart then
+		visualModel:PivotTo(motionRoot.CFrame)
+	end
+
+	applyConfiguredPartOffsets(visualModel, config.partOffsets)
+	visualModel.Parent = character
+
+	for _, descendant in visualModel:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.CanCollide = false
+			descendant.CanTouch = false
+			configureBrainrotQueryPart(descendant)
+			descendant.Massless = true
+			descendant.Anchored = false
+			descendant.CastShadow = false
+
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = motionRoot
+			weld.Part1 = descendant
+			weld.Parent = descendant
+		end
+	end
+
+	startVisualMotion(character, rootPart, motionWeld, config)
+	hideBaseCharacter(character, true)
+end
+
+syncPreviewAssets()
+brainrotAssetsFolder.ChildAdded:Connect(queuePreviewSync)
+brainrotAssetsFolder.ChildRemoved:Connect(queuePreviewSync)
+brainrotAssetsFolder.DescendantAdded:Connect(queuePreviewSync)
+brainrotAssetsFolder.DescendantRemoving:Connect(queuePreviewSync)
+
+local function applyBrainrotLook(player, character)
+	clearBrainrotVisuals(character)
+	hideBaseCharacter(character, false)
+
+	local brainrotId = getEffectiveBrainrotId(player)
+	if not brainrotId then
+		return
+	end
+
+	local config = BRAINROTS[brainrotId]
+	local asset = brainrotAssetsFolder:FindFirstChild(config.assetName)
+	if not asset then
+		return
+	end
+
+	if config.visualMotionStyle and hasNonAccessoryGeometry(asset) then
+		applyAnimatedVisualModel(character, asset, config)
+		createBrainrotHitboxes(character, brainrotId)
+		return
+	end
+
+	local wearablesFound = cloneWearables(character, asset)
+	if not wearablesFound then
+		applyVisualModel(character, asset, config)
+	end
+
+	createBrainrotHitboxes(character, brainrotId)
+end
+
+local function applyBrainrotLoadout(player)
+	local character = player.Character
+	if not character then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local brainrotId = getEffectiveBrainrotId(player)
+	local config = brainrotId and BRAINROTS[brainrotId] or nil
+
+	if humanoid then
+		humanoid.BreakJointsOnDeath = not roundActive
+		humanoid.WalkSpeed = config and config.walkSpeed or 16
+		humanoid.MaxHealth = config and config.maxHealth or 100
+		humanoid.Health = humanoid.MaxHealth
+
+		if humanoid.UseJumpPower then
+			humanoid.JumpPower = config and config.jumpPower or 50
+		else
+			humanoid.JumpHeight = config and config.jumpHeight or 7.2
+		end
+	end
+
+	applyBrainrotLook(player, character)
+	clearGrantedTools(player)
+
+	if not roundActive or not config then
+		clearStandaloneTools(player)
+		return
+	end
+
+	for _, toolName in ipairs(config.kit) do
+		giveToolIfExists(player, toolName)
+	end
+
+	if DEFAULT_SIDEARM_ENABLED then
+		giveToolIfExists(player, DEFAULT_SIDEARM_TOOL_NAME)
+	end
+	if DEBUG_HITSCAN_TEST_WEAPON_ENABLED then
+		giveToolIfExists(player, DEBUG_HITSCAN_TOOL_NAME)
+	end
+
+	if playerRoles[player] == "Traitor" then
+		for _, toolName in ipairs(config.traitorKit) do
+			giveToolIfExists(player, toolName)
+		end
+	end
+end
+
+local function onCharacterAdded(player, character)
+	task.defer(function()
+		character:WaitForChild("Humanoid", 5)
+		character:WaitForChild("HumanoidRootPart", 5)
+		attachCharacterCombatEffects(character)
+		applyBrainrotLoadout(player)
+	end)
+end
+
+local function setupPlayer(player)
+	selectedBrainrots[player] = getSelectedBrainrotId(player)
+	activeRoundBrainrots[player] = nil
+	player:SetAttribute("SelectedBrainrot", selectedBrainrots[player])
+	player:SetAttribute("TTTRole", nil)
+	player:SetAttribute("TTTRoleTeam", nil)
+
+	if characterConnections[player] then
+		characterConnections[player]:Disconnect()
+	end
+
+	characterConnections[player] = player.CharacterAdded:Connect(function(character)
+		onCharacterAdded(player, character)
+	end)
+
+	sendBrainrotState(player)
+
+	if not roundActive then
+		task.defer(function()
+			if player.Parent == Players then
+				player:LoadCharacter()
+			end
+		end)
+	elseif player.Character then
+		onCharacterAdded(player, player.Character)
+	end
+end
+
+RoundEvent.OnServerEvent:Connect(function(player, action)
+	if not DEBUG_KILL_BUTTON_ENABLED then
+		return
+	end
+
+	if action ~= "debugKill" then
+		return
+	end
+
+	local character = player.Character
+	if not character then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	humanoid.Health = 0
+end)
+
+WeaponRemote.OnServerEvent:Connect(function(player, action, tool, origin, direction)
+	if action == "fire" then
+		handleWeaponFire(player, tool, origin, direction)
+		return
+	end
+
+	if action ~= "reload" then
+		return
+	end
+
+	if not roundActive then
+		return
+	end
+
+	if not tool or not tool:IsA("Tool") or tool.Parent ~= player.Character then
+		return
+	end
+
+	local state = weaponStates[tool]
+	if not state or getToolOwner(tool) ~= player then
+		return
+	end
+
+	if not getLiveHumanoid(player) then
+		return
+	end
+
+	beginWeaponReload(player, tool, state)
+end)
+
+BrainrotEvent.OnServerEvent:Connect(function(player, action, brainrotId)
+	if action == "requestBrainrotData" then
+		sendBrainrotState(player)
+		return
+	end
+
+	if action ~= "selectBrainrot" then
+		return
+	end
+
+	if roundActive then
+		sendBrainrotState(player, "brainrot.messages.selectionLockedDuringRound")
+		return
+	end
+
+	if not BRAINROTS[brainrotId] then
+		sendBrainrotState(player, "brainrot.messages.unknown")
+		return
+	end
+
+	selectedBrainrots[player] = brainrotId
+	player:SetAttribute("SelectedBrainrot", brainrotId)
+
+	if player.Character then
+		applyBrainrotLoadout(player)
+	end
+
+	sendBrainrotState(player, "brainrot.messages.selected", {
+		name = BRAINROTS[brainrotId].displayName,
+	})
+end)
+
+Players.PlayerAdded:Connect(setupPlayer)
+
+Players.PlayerRemoving:Connect(function(player)
+	if characterConnections[player] then
+		characterConnections[player]:Disconnect()
+		characterConnections[player] = nil
+	end
+
+	if player.Character then
+		disconnectCharacterCombatEffects(player.Character)
+		disconnectVisualAnimation(player.Character)
+	end
+
+	selectedBrainrots[player] = nil
+	activeRoundBrainrots[player] = nil
+	playerRoles[player] = nil
+	deadPlayers[player] = nil
+end)
+
+for _, player in Players:GetPlayers() do
+	setupPlayer(player)
+end
+
+local function assignRoles()
+	local allPlayers = Players:GetPlayers()
+	playerRoles = {}
+
+	for _, player in ipairs(allPlayers) do
+		playerRoles[player] = "Innocent"
+	end
+
+	local traitorCount, detectiveCount = getRoleDistribution(#allPlayers)
+
+	local shuffled = {}
+	for _, player in ipairs(allPlayers) do
+		table.insert(shuffled, player)
+	end
+
+	for index = #shuffled, 2, -1 do
+		local swapIndex = math.random(1, index)
+		shuffled[index], shuffled[swapIndex] = shuffled[swapIndex], shuffled[index]
+	end
+
+	for index = 1, traitorCount do
+		playerRoles[shuffled[index]] = "Traitor"
+	end
+
+	local innocentCandidates = {}
+	for _, player in ipairs(shuffled) do
+		if playerRoles[player] == "Innocent" then
+			table.insert(innocentCandidates, player)
+		end
+	end
+
+	local assignedDetectiveCount = math.min(detectiveCount, #innocentCandidates)
+	for index = 1, assignedDetectiveCount do
+		playerRoles[innocentCandidates[index]] = "Detective"
+	end
+
+	for _, player in ipairs(allPlayers) do
+		local role = playerRoles[player]
+		local traitorNames = {}
+		local brainrotId = getEffectiveBrainrotId(player)
+		local brainrotConfig = brainrotId and BRAINROTS[brainrotId] or nil
+		local team = if role == "Traitor" then "Traitor" else "Innocent"
+
+		if role == "Traitor" then
+			for otherPlayer, otherRole in playerRoles do
+				if otherRole == "Traitor" and otherPlayer ~= player then
+					table.insert(traitorNames, otherPlayer.Name)
+				end
+			end
+		end
+
+		player:SetAttribute("TTTRole", role)
+		player:SetAttribute("TTTRoleTeam", team)
+
+		RoundEvent:FireClient(player, "roleAssigned", {
+			role = role,
+			team = team,
+			traitorAllies = traitorNames,
+			brainrotId = brainrotId,
+			brainrotName = brainrotConfig and brainrotConfig.displayName or t(player, "common.random"),
+		})
+	end
+end
+
+local function checkWinCondition()
+	if not roundActive then
+		return
+	end
+
+	local aliveTraitors = 0
+	local aliveInnocents = 0
+
+	for player, role in playerRoles do
+		if not deadPlayers[player] then
+			if role == "Traitor" then
+				aliveTraitors += 1
+			else
+				aliveInnocents += 1
+			end
+		end
+	end
+
+	if aliveTraitors == 0 then
+		roundWinner = "Innocent"
+		endRound()
+	elseif aliveInnocents == 0 then
+		roundWinner = "Traitor"
+		endRound()
+	end
+end
+
+local function onPlayerDied(player)
+	local character = player.Character
+	if not character then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+
+	local connection
+	connection = humanoid.Died:Connect(function()
+		deadPlayers[player] = true
+		preserveCorpse(player, character)
+		checkWinCondition()
+	end)
+
+	table.insert(deathConnections, connection)
+end
+
+local function cleanupDeathConnections()
+	for _, connection in deathConnections do
+		if connection then
+			connection:Disconnect()
+		end
+	end
+
+	deathConnections = {}
+end
+
+getRoleDistribution = function(playerCount)
+	local cappedPlayerCount = math.min(playerCount, MAX_PLAYERS)
+
+	if cappedPlayerCount >= 7 then
+		return 2, 1
+	end
+
+	if cappedPlayerCount >= MIN_PLAYERS then
+		return 1, 1
+	end
+
+	return 0, 0
+end
+
+local function getRequiredPlayerCount()
+	if ALLOW_SOLO_ROUND_START then
+		return 1
+	end
+
+	return MIN_PLAYERS
+end
+
+local function getRoundPlayerGateState()
+	local playerCount = #Players:GetPlayers()
+	local requiredPlayerCount = getRequiredPlayerCount()
+
+	if playerCount < requiredPlayerCount then
+		return "round.waitingForPlayers", {
+			playerCount = playerCount,
+			minPlayers = requiredPlayerCount,
+		}
+	end
+
+	if playerCount > MAX_PLAYERS then
+		return "round.tooManyPlayers", {
+			playerCount = playerCount,
+			maxPlayers = MAX_PLAYERS,
+		}
+	end
+
+	return nil
+end
+
+local function intermission()
+	local countdownId = beginNewCountdown()
+	roundActive = false
+	roundWinner = ""
+	activeRoundBrainrots = {}
+
+	for _, player in Players:GetPlayers() do
+		clearStandaloneTools(player)
+	end
+
+	syncBrainrotStateForAll("brainrot.messages.chooseForNextRound")
+
+	while true do
+		local gateMessageKey, gateMessageParams = getRoundPlayerGateState()
+		if not gateMessageKey then
+			break
+		end
+
+		if countdownId ~= countdownToken then
+			return false
+		end
+
+		broadcastLocalized("waiting", {
+			timeLeft = 0,
+		}, gateMessageKey, gateMessageParams)
+
+		task.wait(2)
+	end
+
+	for timeLeft = INTERMISSION_TIME, 1, -1 do
+		if countdownId ~= countdownToken then
+			return false
+		end
+
+		local gateMessageKey = getRoundPlayerGateState()
+		if gateMessageKey then
+			return false
+		end
+
+		broadcastLocalized("intermission", {
+			timeLeft = timeLeft,
+		}, "round.nextRoundIn")
+
+		task.wait(1)
+	end
+
+	return true
+end
+
+local function startRound()
+	local gateMessageKey = getRoundPlayerGateState()
+	if gateMessageKey then
+		return
+	end
+
+	local countdownId = beginNewCountdown()
+	roundActive = true
+	roundWinner = ""
+	cleanupDeathConnections()
+	cleanupSpawnedCorpses()
+
+	activeRoundBrainrots = {}
+	for _, player in Players:GetPlayers() do
+		activeRoundBrainrots[player] = getSelectedBrainrotId(player) or getRandomBrainrotId()
+	end
+
+	syncBrainrotStateForAll("brainrot.messages.roundStarting")
+
+	for _, player in Players:GetPlayers() do
+		player:LoadCharacter()
+	end
+
+	task.wait(1)
+
+	if not roundActive or countdownId ~= countdownToken then
+		return
+	end
+
+	assignRoles()
+	deadPlayers = {}
+
+	for _, player in Players:GetPlayers() do
+		applyBrainrotLoadout(player)
+		onPlayerDied(player)
+	end
+
+	broadcastLocalized("roundStart", nil, "round.started")
+
+	if isSoloReturnTest() then
+		for timeLeft = DEBUG_SOLO_ROUND_TIME, 1, -1 do
+			if not roundActive or countdownId ~= countdownToken then
+				break
+			end
+
+			broadcastLocalized("roundActive", {
+				timeLeft = timeLeft,
+			}, "round.inProgress")
+
+			task.wait(1)
+		end
+
+		if roundActive and countdownId == countdownToken then
+			roundWinner = "Innocent"
+			endRound()
+		end
+
+		return
+	end
+
+	for timeLeft = ROUND_TIME, 1, -1 do
+		if not roundActive or countdownId ~= countdownToken then
+			break
+		end
+
+		broadcastLocalized("roundActive", {
+			timeLeft = timeLeft,
+		}, "round.inProgress")
+
+		task.wait(1)
+	end
+
+	if roundActive and countdownId == countdownToken then
+		roundWinner = "Innocent"
+		endRound()
+	end
+end
+
+function endRound()
+	if not roundActive then
+		return
+	end
+
+	roundActive = false
+	countdownToken += 1
+
+	cleanupDeathConnections()
+
+	broadcastLocalized("roundEnd", {
+		timeLeft = 0,
+		winner = roundWinner,
+	}, roundWinner == "Innocent" and "round.ending.innocentsWin" or "round.ending.traitorsWin")
+end
+
+while true do
+	local intermissionFinished = intermission()
+	if intermissionFinished then
+		startRound()
+
+		task.wait(POST_ROUND_RETURN_DELAY)
+
+		local returnedPlayersToLobby = returnPlayersToLobby()
+		if returnedPlayersToLobby then
+			task.wait(2)
+		else
+			playerRoles = {}
+			deadPlayers = {}
+			cleanupSpawnedCorpses()
+
+			for _, player in Players:GetPlayers() do
+				player:SetAttribute("TTTRole", nil)
+				player:SetAttribute("TTTRoleTeam", nil)
+				player:LoadCharacter()
+			end
+		end
+	else
+		task.wait(1)
+	end
+end
